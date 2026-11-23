@@ -537,26 +537,31 @@
 
     const grid = el('div', 'ps-grid');
     let commented = false;
-    for (const row of PS.buildRows(model)) {
-      const rowEl = el('div', 'ps-row');
-      if (row.kind) rowEl.classList.add(`ps-row-${row.kind}`);
-      rowEl.setCssProps({ '--ps-depth': String(row.depth) });
-      rowEl.appendChild(el('span', 'ps-num', settings.lineNumbers && row.number != null ? String(row.number) : ''));
+    // A line's cells (number, code, comment) are placed straight into the block's
+    // grid, so code and comments line up across lines. Each cell carries its line's
+    // classes and indent.
+    const rows = PS.buildRows(model);
+    rows.forEach((row, index) => {
+      const lineClasses = [];
+      if (row.kind) lineClasses.push(`ps-row-${row.kind}`);
+      if (row.kind === 'function' && index > 0) lineClasses.push('ps-fn-later');
+      if (index > 0 && rows[index - 1].kind === 'function') lineClasses.push('ps-after-fn');
+      const cell = (className, text) => {
+        const node = el('span', className, text);
+        lineClasses.forEach((name) => node.classList.add(name));
+        node.setCssProps({ '--ps-depth': String(row.depth) });
+        grid.appendChild(node);
+        return node;
+      };
+      cell('ps-num', settings.lineNumbers && row.number != null ? String(row.number) : '');
       // A comment-only line has no code cell: its comment starts at the code
       // column, at the line's indent, and runs to the right edge (CLRS).
       // A procedure header without a comment spans the comment column too, so a long
       // parameter list does not squeeze the comments of the lines below it.
       const span = row.kind === 'function' && !row.comment;
-      if (!row.note) {
-        const codeEl = el('span', span ? 'ps-code ps-span' : 'ps-code');
-        renderInline(codeEl, row.text);
-        rowEl.appendChild(codeEl);
-      }
-      if (span) {
-        grid.appendChild(rowEl);
-        continue;
-      }
-      const commentEl = el('span', row.note ? 'ps-comment ps-note' : 'ps-comment');
+      if (!row.note) renderInline(cell(span ? 'ps-code ps-span' : 'ps-code'), row.text);
+      if (span) return;
+      const commentEl = cell(row.note ? 'ps-comment ps-note' : 'ps-comment');
       if (row.comment) {
         commented = true;
         // clrscode \CommentSymbol: bold, tightly kerned slashes.
@@ -564,9 +569,7 @@
         commentEl.appendChild(document.createTextNode(' '));
         renderInline(commentEl, row.comment, true);
       }
-      rowEl.appendChild(commentEl);
-      grid.appendChild(rowEl);
-    }
+    });
 
     if (commented) block.addClass('ps-commented');
     block.appendChild(grid);

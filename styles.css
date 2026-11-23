@@ -86,18 +86,10 @@
   grid-template-columns: max-content minmax(auto, max-content) minmax(8em, 1fr);
 }
 
-/* Each line spans the block's grid and shares its columns, so code and
- * comments line up across lines. */
-.ps-row {
-  display: grid;
-  grid-column: 1 / -1;
-  grid-template-columns: subgrid;
-  row-gap: 0.1em; /* when a narrow pane puts the comment under its line */
-  align-items: baseline;
-}
-
-/* CLRS: line numbers in the text font, same size and colour as the code. */
+/* CLRS: line numbers in the text font, same size and colour as the code.
+ * Each number starts a new line of the grid. */
 .ps-num {
+  grid-column: 1;
   text-align: right;
   font-variant-numeric: tabular-nums;
   user-select: none;
@@ -123,11 +115,11 @@
 }
 
 /* Procedure header: leads its body, with air before each later procedure. */
-.ps-row-function:not(:first-child) > * {
+.ps-fn-later {
   padding-top: 0.8em;
 }
 
-.ps-row-function + .ps-row > * {
+.ps-after-fn {
   padding-top: 0.15em;
 }
 
