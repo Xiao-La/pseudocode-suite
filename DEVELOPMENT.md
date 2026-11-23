@@ -51,6 +51,9 @@ Obsidian 安装插件时只下载 `main.js`、`manifest.json`、`styles.css`，�
 - `document.activeElement` 用 `activeDocument`（弹出窗口）。
 - UI 文字用 sentence case。
 - 另一个插件已注册 `pseudo` 代码块时不报错退出，而是提示用户。
+- 目录审核的 CSS 检查：不用 `!important`、`:has`（有注释的块由渲染器加 class `ps-commented`）、`display: contents`（行用 `subgrid` 共享整块的列，所以 `minAppVersion` 是 1.5.7）、`column-gap`（用 `gap` 简写）、自定义元素选择器（`mjx-mo`）。
+- `LICENSE` 保持标准 MIT 原文，GitHub 才能识别；字体许可放在 `fonts/LICENSE.md`。
+- 发布工作流给 `main.js`、`manifest.json`、`styles.css` 生成 GitHub artifact attestation。
 
 ## 实现要点
 

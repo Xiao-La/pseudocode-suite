@@ -43,7 +43,7 @@
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
-  column-gap: 0.45em;
+  gap: 0 0.45em;
   font-size: 1.12em;
   font-weight: 700;
   line-height: 1.35;
@@ -62,18 +62,24 @@
   display: grid;
   /* Code keeps its full width when it fits; comments wrap first. */
   grid-template-columns: max-content minmax(auto, max-content) 0;
-  column-gap: 0.9em;
-  row-gap: 0.1em;
+  gap: 0.1em 0.9em;
   align-items: baseline;
   max-width: 100%;
 }
 
-.ps-block:has(.ps-comment:not(:empty)) .ps-grid {
+/* Set by the renderer when some line has a comment (no :has, which is slow). */
+.ps-block.ps-commented .ps-grid {
   grid-template-columns: max-content minmax(auto, max-content) minmax(8em, 1fr);
 }
 
+/* Each line spans the block's grid and shares its columns, so code and
+ * comments line up across lines. */
 .ps-row {
-  display: contents;
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  row-gap: 0.1em; /* when a narrow pane puts the comment under its line */
+  align-items: baseline;
 }
 
 /* CLRS: line numbers in the text font, same size and colour as the code. */
@@ -114,7 +120,7 @@
 /* Narrow panes: comments move under their line instead of squeezing code. */
 @media (max-width: 600px) {
   .ps-grid,
-  .ps-block:has(.ps-comment:not(:empty)) .ps-grid {
+  .ps-block.ps-commented .ps-grid {
     grid-template-columns: max-content minmax(0, 1fr);
   }
   .ps-comment {
@@ -153,7 +159,7 @@
 }
 
 /* CLRS \isequal: two `=` narrowed to 80% with 1pt between them. */
-.ps-block mjx-mo.ps-eq {
+.ps-block .ps-eq {
   display: inline-block;
   transform: scaleX(0.8);
   margin: 0 -0.078em;
@@ -218,8 +224,8 @@
 }
 
 @media print {
-  .ps-edit-btn {
-    display: none !important;
+  .ps-block .ps-edit-btn {
+    display: none;
   }
 }
 

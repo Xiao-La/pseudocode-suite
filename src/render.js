@@ -536,6 +536,7 @@
     }
 
     const grid = el('div', 'ps-grid');
+    let commented = false;
     for (const row of PS.buildRows(model)) {
       const rowEl = el('div', 'ps-row');
       if (row.kind) rowEl.classList.add(`ps-row-${row.kind}`);
@@ -557,6 +558,7 @@
       }
       const commentEl = el('span', row.note ? 'ps-comment ps-note' : 'ps-comment');
       if (row.comment) {
+        commented = true;
         // clrscode \CommentSymbol: bold, tightly kerned slashes.
         commentEl.appendChild(el('span', 'ps-comment-mark', settings.commentDelimiter || '//'));
         commentEl.appendChild(document.createTextNode(' '));
@@ -566,6 +568,7 @@
       grid.appendChild(rowEl);
     }
 
+    if (commented) block.addClass('ps-commented');
     block.appendChild(grid);
     return block;
   };
