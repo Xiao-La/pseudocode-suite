@@ -1,0 +1,65 @@
+# 开发说明
+
+## 目录
+
+```
+pseudocode-suite/
+├── main.js            ← 构建产物（发布用）
+├── styles.css         ← 构建产物（发布用，内嵌字体）
+├── manifest.json      ← 发布用
+├── versions.json      ← 插件版本 → 最低 Obsidian 版本
+├── build.py           ← 拼接 src/ → main.js，内嵌字体 → styles.css
+├── src/
+│   ├── core.js        ← AST、LaTeX 解析 / 生成、打字识别（typedLine）、纯文本粘贴解析（parsePlain）
+│   ├── render.js      ← 渲染器（AST → DOM）
+│   ├── builder.js     ← 可视化搭建器（含提示面板、底部提示）
+│   ├── main.js        ← 插件入口（命令、代码块处理器、设置页）
+│   └── styles.css
+├── fonts/
+│   ├── *.woff2        ← tools/make-fonts.py 生成的子集
+│   ├── source/        ← 原始字体
+│   └── LICENSE.md
+├── tools/make-fonts.py
+└── tests/             ← node tests/test-*.js
+```
+
+## 构建与发布
+
+```bash
+python3 build.py
+for t in core render main builder; do node tests/test-$t.js; done
+```
+
+本地开发：仓库在 `~/Code/Obsidian/pseudocode-suite`，两个库的 `.obsidian/plugins/pseudocode-suite` 都是指向它的符号链接；改完 `python3 build.py`，在 Obsidian 里重载插件即可。`data.json`（设置）不进仓库。
+
+发布新版本：
+
+1. 改 `manifest.json` 的 `version`；如果提高了最低 Obsidian 版本，在 `versions.json` 加一行 `"版本": "最低 Obsidian 版本"`。
+2. `python3 build.py`，跑测试，提交并推送（`main.js`、`styles.css` 也要提交，工作流会检查它们和源码一致）。
+3. 推送与版本号完全相同的 tag（不加 `v`）：`git tag 2.2.1 && git push origin 2.2.1`。`.github/workflows/release.yml` 会构建、测试，并建 Release 上传 `main.js`、`manifest.json`、`styles.css`。
+
+首次上架（只做一次）：在 `obsidianmd/obsidian-releases` 的 `community-plugins.json` 末尾加一项，提 PR，等自动检查和人工审核。之后发新版只需要发 Release。
+
+Obsidian 安装插件时只下载 `main.js`、`manifest.json`、`styles.css`，所以字体必须内嵌在 `styles.css` 里（`build.py` 负责）。
+
+## 上架规范自查（已处理）
+
+- 不用正则后行断言（iOS 16.4 以前不支持）：需要时在替换回调里检查前一个字符（`precededBy`、`inCommand`）。
+- 不往页面插 `<style>`；样式全在 `styles.css`，动态值用 CSS 变量 + `setCssProps`，显隐用 class。
+- 不用 `navigator.platform`，用 `Platform`；不用 `innerHTML`；不用全局 `app`；没有默认快捷键；命令 id / 名称不含插件名。
+- 文件修改用 `Vault.process`（后台）或 `Editor`（当前编辑器）。
+- `document.activeElement` 用 `activeDocument`（弹出窗口）。
+- UI 文字用 sentence case。
+- 另一个插件已注册 `pseudo` 代码块时不报错退出，而是提示用户。
+
+## 实现要点
+
+- 渲染器直接产出 CLRS 版式的 DOM；导出 PDF 时一致。
+- 数学片段用 Obsidian 的 `renderMath` 同步排版（`PS.typesetMath`），输出与笔记中的行内公式相同；出错时退回 `MarkdownRenderer`。`finishRenderMath()` 较慢（约 100ms，块在此之前隐藏，class `ps-pending`），所以排好的公式按 TeX 缓存（LRU，4000 条），重绘时直接克隆。缓存不跨会话。
+- 操作符别名（`\gets`、`:=`、`&&`…）和 ASCII → TeX 的转换在 `core.js` 里各只有一张表，搭建器、序列化和渲染共用。
+- 编辑按钮点击时才用 `getSectionInfo` 取当前行号，再按块内容核对；内容相同的块取离该行最近的一个。
+- 解析器把数学上下文记在 AST 里（`textMath` / `condMath` / `argsMath`…），渲染时还原 `$...$`，下标不会以源码形式漏出。
+- 搭建器预览走 `serialize → parse → render`，与保存后的结果一致。
+- 打字转换只在“刚打出”时触发（与上一次的值 `settled` 比较），输入法组字期间跳过，`compositionend` 时再判断；每次转换是一个撤销步骤。
+- 手写块里的独立 `\Comment{…}` 行并到上一条语句的行尾（LaTeX 的语义）；搭建器里输入或粘贴的 `// …` 行保存为 `\State \Comment{…}`，单独占一行。
+- 设置里的 `builderTips` 记录提示面板是否展开；它不影响渲染，所以用 `saveSettingsOnly` 保存，不重绘已渲染的块。

@@ -1,0 +1,10 @@
+{
+  "id": "pseudocode-suite",
+  "name": "Pseudocode Suite",
+  "version": "2.2.0",
+  "minAppVersion": "1.4.0",
+  "description": "Write algorithms in CLRS textbook style. Type or paste pseudocode into a visual builder and get numbered, typeset blocks.",
+  "author": "xiao-la",
+  "authorUrl": "https://github.com/Xiao-La",
+  "isDesktopOnly": false
+}
