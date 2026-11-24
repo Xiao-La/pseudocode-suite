@@ -6,6 +6,8 @@
 - **可视化搭建**：打 `if x > 0`、`for i = 1 to n`、`else`，这一行就变成对应的块；从任何地方粘贴伪代码（Python、C、带行号的 CLRS、LaTeX）会自动解析成行。右侧实时预览。
 - **就地编辑**已有的块，callout 和引用里的块也可以。
 
+![渲染后的伪代码块：Stack-Empty、Push、Pop，带行号、粗体关键字和小型大写过程名，以及 Edit 按钮](docs/images/rendered-block.webp)
+
 [English](README.md)
 
 ## 快速上手
@@ -14,6 +16,8 @@
 2. 填标题（可不填），按 <kbd>Enter</kbd>。
 3. 输入第一行，例如 `procedure Insertion-Sort(A, n)`，然后接着写。每按一次 <kbd>Enter</kbd> 开一行，右侧预览实时更新。
 4. 按 <kbd>Ctrl/Cmd</kbd>+<kbd>Enter</kbd> 或点 **Save**，块插入到光标处。
+
+![伪代码搭建器：左侧逐行编辑，右侧是实时预览和打字提示](docs/images/builder.webp)
 
 以后要改：在阅读视图或 Live Preview 里把鼠标移到块上，点 **Edit**。源码模式下把光标放进块里，运行 **Edit pseudocode block under cursor**，或用右键菜单。
 

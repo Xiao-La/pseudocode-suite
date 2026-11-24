@@ -6,6 +6,8 @@ Write algorithms the way *Introduction to Algorithms* (CLRS) prints them, withou
 - **Builds** them visually. Type `if x > 0`, `for i = 1 to n` or `else` and the line becomes the block you meant. Paste pseudocode from anywhere (Python, C, CLRS with line numbers, LaTeX) and it is parsed into rows. A live preview shows the result.
 - **Edits** any existing block in place, including blocks inside callouts and quotes.
 
+![A rendered pseudocode block: Stack-Empty, Push and Pop with numbered lines, bold keywords and small-caps names, plus the Edit button](docs/images/rendered-block.webp)
+
 [中文说明](README.zh-CN.md)
 
 ## Getting started
@@ -14,6 +16,8 @@ Write algorithms the way *Introduction to Algorithms* (CLRS) prints them, withou
 2. Give the algorithm a title (optional) and press <kbd>Enter</kbd>.
 3. Type the first line, for example `procedure Insertion-Sort(A, n)`, and keep going. Each <kbd>Enter</kbd> starts a new line; the preview on the right updates as you type.
 4. Press <kbd>Ctrl/Cmd</kbd>+<kbd>Enter</kbd> or click **Save**. The block is inserted at the cursor.
+
+![The pseudocode builder: rows on the left, the live preview and typing tips on the right](docs/images/builder.webp)
 
 To change a block later, hover over it in reading view or Live Preview and click **Edit**. In the source editor, put the cursor inside the block and run **Edit pseudocode block under cursor**, or use the right-click menu.
 

@@ -19,6 +19,7 @@ pseudocode-suite/
 │   ├── *.woff2        ← tools/make-fonts.py 生成的子集
 │   ├── source/        ← 原始字体
 │   └── LICENSE.md
+├── docs/images/       ← README 截图
 ├── tools/make-fonts.py
 └── tests/             ← node tests/test-*.js
 ```
