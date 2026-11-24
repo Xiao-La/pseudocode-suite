@@ -315,4 +315,71 @@ const lastState = (modal) => {
   ok(/first line/.test(hint(null, null, 'caption', '', false)), 'title hint');
 }
 
+// 2.3: new blocks typed in the builder.
+{
+  const m = open(EMPTY);
+  ok(type(m, m.model.nodes[0], 'loop') || press(m, m.model.nodes[0], 'Enter', {}, { value: 'loop' }), 'loop is typed');
+  const loop = m.model.nodes[0];
+  eq([loop.type, loop.body.length, m.pendingFocus], ['loop', 1, `${loop.body[0].id}::text`], 'loop opens with its first line focused');
+}
+{
+  const m = open(EMPTY);
+  ok(type(m, m.model.nodes[0], 'switch '), '"switch " makes a switch');
+  const sw = m.model.nodes[0];
+  eq([sw.type, m.pendingFocus], ['switch', `${sw.id}::cond`], 'focus on the value');
+}
+{
+  const m = open('\\Switch{$x$}\n\\Case{$1$}\n\\State $a$\n\\State \\text{}\n\\EndCase\n\\EndSwitch');
+  const sw = m.model.nodes[0];
+  ok(type(m, sw.body[0].body[1], 'case '), '"case " on a line in a case');
+  eq(sw.body.map((n) => n.type), ['case', 'case'], 'a case typed inside a case becomes the next case');
+  eq(sw.body[0].body.length, 1, 'the first case keeps its line');
+  const d = open('\\Switch{$x$}\n\\Case{$1$}\n\\State $a$\n\\State \\text{}\n\\EndCase\n\\EndSwitch');
+  const line = d.model.nodes[0].body[0].body[1];
+  type(d, line, 'default');
+  press(d, line, 'Enter', {}, { value: 'default' });
+  const cases = d.model.nodes[0].body;
+  eq([cases.length, !!cases[1].default, cases[1].body.length], [2, true, 1], 'default becomes the last case with a first line');
+}
+{
+  const m = open(EMPTY);
+  type(m, m.model.nodes[0], 'for ');
+  const loop = m.model.nodes[0];
+  ok(type(m, loop, '(int i = 0; i < n; i++)', { key: 'init' }), 'a complete C head converts');
+  eq([loop.init, loop.bound, loop.downto, m.pendingFocus], ['i = 0', 'n - 1', false, `${loop.id}::bound`], 'into CLRS bounds');
+  const r = open(EMPTY);
+  type(r, r.model.nodes[0], 'for ');
+  const py = r.model.nodes[0];
+  type(r, py, 'i in range(1, n + 1)', { key: 'init' });
+  eq([py.all, py.init, py.bound], [false, 'i = 1', 'n'], 'range() is a counting loop, not for-each');
+}
+{
+  const m = open(EMPTY);
+  ok(type(m, m.model.nodes[0], '如果 '), '"如果 " makes an if');
+  eq(m.model.nodes[0].type, 'if', 'Chinese keyword');
+  const w = open(EMPTY);
+  ok(type(w, w.model.nodes[0], '当 '), '"当 " makes a while');
+  const f = open(EMPTY);
+  type(f, f.model.nodes[0], '对于 ');
+  eq(f.model.nodes[0].type, 'for', '"对于 " makes a for');
+  const p = open(EMPTY);
+  type(p, p.model.nodes[0], 'parallel for ');
+  ok(p.model.nodes[0].type === 'for' && p.model.nodes[0].parallel, '"parallel for " makes a parallel for');
+}
+{
+  const m = open(EMPTY);
+  type(m, m.model.nodes[0], 'S = S ∪ {u} % set');
+  eq(latex(m), ['  \\State $S = S ∪ \\{u\\} \\% \\mathit{set}$'], 'braces and % typed in a field are escaped');
+}
+
+{
+  // 当 … 时: Enter drops 时 and the condition is math again.
+  const m = open(EMPTY);
+  type(m, m.model.nodes[0], '当 ');
+  const w = m.model.nodes[0];
+  type(m, w, 'i > 0 时', { key: 'cond' });
+  press(m, w, 'Enter', {}, { key: 'cond', value: 'i > 0 时' });
+  eq(latex(m).slice(0, 1), ['  \\While{$i > 0$}'], 'Chinese while: condition saved as math');
+}
+
 done();

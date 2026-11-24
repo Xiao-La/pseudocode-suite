@@ -1,6 +1,6 @@
 const { loadMain, suite } = require('./harness');
 
-const { scanFences, locateFence, prefixed, CSS_LENGTH } = loadMain();
+const { scanFences, locateFence, prefixed, CSS_LENGTH, codeFenceAt } = loadMain();
 const { ok, eq, done } = suite();
 
 const note = [
@@ -39,5 +39,17 @@ eq(prefixed('\\State x', ''), ['\\State x'], 'no prefix');
 
 ok(['1.2em', '16px', '.5rem', '2ch'].every((v) => CSS_LENGTH.test(v)), 'valid indent widths');
 ok(!['', '12', 'red', '1.2 em', 'calc(1em)'].some((v) => CSS_LENGTH.test(v)), 'invalid indent widths rejected');
+
+// Any code block under the cursor (for "Convert to pseudocode").
+{
+  const lines = ['text', '```python', 'def f(x):', '    return x', '```', '', '> ~~~c', '> int x;', '> ~~~', '```'];
+  const py = codeFenceAt(lines, 2);
+  eq([py.start, py.end, py.language, py.source], [1, 4, 'python', 'def f(x):\n    return x'], 'python block found from inside');
+  eq(codeFenceAt(lines, 1).start, 1, 'on the opening line');
+  eq(codeFenceAt(lines, 0), null, 'outside any block');
+  const quoted = codeFenceAt(lines, 7);
+  eq([quoted.language, quoted.source, quoted.prefix], ['c', 'int x;', '> '], 'callout / quote block with ~~~');
+  eq(codeFenceAt(lines, 9), null, 'an unclosed fence is not a block');
+}
 
 done();

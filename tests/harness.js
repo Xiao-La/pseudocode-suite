@@ -41,7 +41,7 @@ function loadMain() {
   class Stub {}
   new Function(
     'module', 'Plugin', 'PluginSettingTab', 'Setting', 'Notice', 'TFile', 'MarkdownView', 'MarkdownRenderChild', 'Component', 'setIcon', 'PS',
-    `${read('main.js')}\nmodule.exports = { scanFences, locateFence, prefixed, CSS_LENGTH };`,
+    `${read('main.js')}\nmodule.exports = { scanFences, locateFence, prefixed, CSS_LENGTH, codeFenceAt };`,
   )(scope, Stub, Stub, Stub, Stub, Stub, Stub, Stub, Stub, () => {}, {});
   return scope.exports;
 }

@@ -244,4 +244,162 @@ let visited = 0;
 PS.walk(tree.nodes, () => { visited++; });
 eq(visited, 4, 'walk visits every node');
 
+// ---- 2.3: TeX specials in builder fields ----
+{
+  const saved = (text) => PS.serializeLatex({ caption: '', nodes: [PS.statementNode(text)] }).split('\n')[2].trim();
+  const back = (text) => PS.parseLatex(saved(text)).nodes[0].text;
+  const stable = (text) => {
+    const once = PS.serializeLatex({ caption: '', nodes: [PS.statementNode(text)] });
+    return PS.serializeLatex(PS.parseLatex(once)) === once;
+  };
+  eq(saved('i % 2 == 0'), '\\State $i \\% 2 == 0$', '% escaped (MathJax would read a comment)');
+  eq(saved('S = S ∪ {u}'), '\\State $S = S ∪ \\{u\\}$', 'set braces escaped');
+  eq(saved('heap_size = 0'), '\\State $\\mathit{heap\\_size} = 0$', 'snake_case is one italic name');
+  eq(saved('x_i = 0'), '\\State $x_i = 0$', 'one-letter base keeps its subscript');
+  eq(saved('n^{k+1}'), '\\State $n^{k+1}$', 'superscript group kept');
+  eq(saved('a & b # c'), '\\State $a \\& b \\# c$', '& and # escaped');
+  eq(saved('cost $5'), '\\State $\\mathit{cost} \\$5$', 'a lone $ is a dollar sign');
+  ['i % 2 == 0', 'S = S ∪ {u}', 'heap_size = 0', 'cost $5', 'a & b', 'n^{k+1}', 'A.left_child = NIL'].forEach((text) => {
+    eq(back(text), text, `field reads back as typed: ${text}`);
+    ok(stable(text), `saving twice changes nothing: ${text}`);
+  });
+  eq(saved('完成 100%'), '\\State 完成 100\\%', 'prose (CJK) escapes % too');
+  eq(back('完成 100%'), '完成 100%', 'and reads it back');
+}
+
+// ---- 2.3: math shortcuts ----
+eq(PS.toMath('floor(n/2) + ceil(m)'), '$\\lfloor n/2 \\rfloor + \\lceil m \\rceil$', 'floor / ceil');
+eq(PS.toMath('sqrt(n) + abs(x)'), '$\\sqrt{n} + \\lvert x \\rvert$', 'sqrt / abs');
+eq(PS.toMath('floor((lo + hi) / 2)'), '$\\lfloor (\\mathit{lo} + \\mathit{hi}) / 2 \\rfloor$', 'nested parentheses');
+eq(PS.toMath('d[v] = inf'), '$d[v] = \\infty$', 'inf');
+eq(PS.toMath('x = infinity'), '$x = \\infty$', 'infinity');
+eq(PS.toMath('p = None'), '$p = \\textsc{nil}$', 'None is NIL');
+eq(PS.toMath('p = null'), '$p = \\textsc{nil}$', 'null is NIL');
+eq(PS.toMath('x = n**2'), '$x = n^{2}$', 'power');
+eq(PS.toMath(PS.normalizeOperators('!done')), 'not $\\mathit{done}$', '!x is not x');
+eq(PS.normalizeOperators('n! + 1 != 2'), 'n! + 1 != 2', 'factorial and != untouched');
+eq(PS.parseLatex('\\State $x = \\lfloor n/2 \\rfloor + \\infty$').nodes[0].text, 'x = floor(n/2) + ∞', 'read back in builder spelling');
+eq(PS.parseLatex('\\State $x = \\left\\lfloor n/2 \\right\\rfloor$').nodes[0].text, 'x = \\left\\lfloor n/2 \\right\\rfloor', '\\left\\lfloor left alone');
+eq(PS.toMath('x = spawn Fib(n - 1)'), '$x =$ \\textbf{spawn} \\Call{Fib}{$n - 1$}', 'spawn is bold');
+eq(PS.toMath('sync'), '\\textbf{sync}', 'sync is bold');
+
+// ---- 2.3: parser robustness and new blocks ----
+{
+  const m = PS.parseLatex('\\If{$a$}\n\\ForEach{$v \\in V$}\n\\State $x$\n\\EndFor\n\\State $y$\n\\EndIf\n\\State $z$');
+  eq(m.nodes.length, 2, 'ForEach closes itself, not the if around it');
+  eq(m.nodes[0].branches[0].body.map((n) => n.type), ['for', 'state'], 'y stays inside the if');
+  ok(m.nodes[0].branches[0].body[0].all, 'ForEach is a for-each');
+  const stray = PS.parseLatex('\\If{$a$}\n\\State $x$\n\\EndWhile\n\\State $y$\n\\EndIf');
+  eq(stray.nodes[0].branches[0].body.length, 2, 'a stray \\EndWhile does not close the if');
+}
+{
+  const src = [
+    '\\begin{algorithm}', '\\begin{algorithmic}[0]', '  \\setcounter{ALG@line}{4}', '  \\Statex \\textbf{Phase 1}',
+    '  \\State $x = 1$ \\label{init} % highlight', '  \\If{$x > 0$}', '    \\State go to line \\ref{init}', '  \\Else \\label{els}',
+    '    \\State $y$', '  \\EndIf', '  \\Switch{$c$}', '    \\Case{$1$}', '      \\State $a$', '    \\EndCase', '    \\Default',
+    '      \\State $b$', '    \\EndCase', '  \\EndSwitch', '  \\Loop', '    \\State \\textbf{sync}', '  \\EndLoop',
+    '  \\ParFor{$i = 1$ \\To $n$}', '    \\State $x =$ \\textbf{spawn} \\Call{Fib}{$n - 1$}', '  \\EndFor', '  \\Statex',
+    '\\end{algorithmic}', '\\end{algorithm}',
+  ].join('\n');
+  const m = PS.parseLatex(src);
+  eq(PS.serializeLatex(m), src, 'labels, highlight, Statex, options, switch, loop and parallel for survive a save');
+  eq([m.numbers, m.start], [false, 5], 'block options read');
+  eq(m.nodes.map((n) => n.type), ['statex', 'state', 'if', 'switch', 'loop', 'for', 'statex'], 'node types');
+  eq([m.nodes[1].label, m.nodes[1].mark, m.nodes[2].elseLabel], ['init', true, 'els'], 'label / highlight kept on their lines');
+  ok(m.nodes[5].parallel, 'ParFor is a parallel for');
+  const standalone = PS.parseLatex('\\State $x$\n\\label{a}\n\\State $y$');
+  eq(standalone.nodes[0].label, 'a', 'a \\label on its own line names the line above');
+  const mid = PS.parseLatex('\\State $x$\n\\setcounter{ALG@line}{9}\n\\State $y$');
+  eq(mid.nodes[1], Object.assign({ id: mid.nodes[1].id }, { type: 'counter', value: '10' }), 'a counter in the middle is a line');
+}
+{
+  const m = PS.parseLatex('\\Switch{$x$}\n\\Case{$1$}\n\\State $a$\n\\Case{$2$}\n\\State $b$\n\\Default\n\\State $c$\n\\EndSwitch\n\\State $d$');
+  eq(m.nodes.length, 2, 'cases close each other without \\EndCase');
+  eq(m.nodes[0].body.map((n) => (n.default ? 'default' : n.value)), ['1', '2', 'default'], 'three cases');
+}
+
+// ---- 2.3: export ----
+{
+  const m = PS.parseLatex('\\If{$a$}\n\\Return $1$\n\\Elif{$b$}\n\\Print $x$\n\\Break\n\\EndIf\n\\For{$i = 1$ \\To $n$}\n\\State $A[1 \\twodots n]$\n\\EndFor\n\\State $x ≤ ∞$');
+  const out = PS.exportLatex(m);
+  ok(out.includes('%   \\usepackage{algpseudocode}') || out.includes('\\usepackage[noend]{algpseudocode}'), 'preamble listed');
+  ok(out.includes('\\begin{algorithmic}[1]'), 'numbered by default');
+  ok(out.includes('\\ElsIf{$b$}') && !out.includes('\\Elif'), 'ElsIf');
+  ok(out.includes('\\State \\Return $1$'), 'Return inside a State');
+  ok(out.includes('\\State \\textbf{print} $x$') && out.includes('\\State \\textbf{break}'), 'print / break spelled out');
+  ok(out.includes('\\textbf{to}') && !out.includes('\\To'), 'to spelled out');
+  ok(out.includes('\\mathinner{\\ldotp\\ldotp}') && !out.includes('\\twodots'), 'range dots');
+  ok(out.includes('\\ensuremath{\\le}') && out.includes('\\infty'), 'unicode symbols as TeX');
+  ok(!out.includes('\\algdef'), 'no extra definitions when not needed');
+  const sw = PS.exportLatex(PS.parseLatex('\\Switch{$x$}\n\\Default\n\\State $a$\n\\EndSwitch'));
+  ok(sw.includes('\\algdef{SE}[SWITCH]') && sw.includes('\\EndDefault'), 'switch definitions and \\EndDefault');
+  const hidden = PS.exportLatex({ caption: '', numbers: false, start: 3, nodes: [] });
+  ok(hidden.includes('\\begin{algorithmic}\n') && hidden.includes('\\makeatletter\\setcounter{ALG@line}{2}\\makeatother'), 'options exported');
+}
+
+// ---- 2.3: typed lines ----
+{
+  const t = (text, final = true) => PS.typedLine(text, { final });
+  eq(PS.splitSignature('f(x) -> int'), { name: 'f', args: 'x' }, 'Python return type dropped');
+  eq(PS.splitSignature('f(x) returns int'), { name: 'f', args: 'x' }, 'returns T dropped');
+  eq(PS.splitSignature('bsearch(A: list[int], x: int = 0)'), { name: 'bsearch', args: 'A, x' }, 'annotations and defaults dropped');
+  eq(PS.splitSignature('sum(int[] A, const vector<int>& v, int *p)'), { name: 'sum', args: 'A, v, p' }, 'C / Java parameter types dropped');
+  eq(PS.splitSignature('Max-Heapify(A, i'), { name: 'Max-Heapify', args: 'A, i' }, 'still typing: unclosed args');
+  eq(t('int max(int a, int b) {').fields, { kind: 'Function', name: 'max', args: 'a, b' }, 'C function header (pasted)');
+  eq(PS.typedLine('int max(int a, int b) {'), null, 'not while typing');
+  eq(t('for (int i = 0; i < n; i++)').fields, { init: 'i = 0', bound: 'n - 1', downto: false, split: true }, 'C for');
+  eq(t('for (i = n; i >= 1; i--)').fields, { init: 'i = n', bound: '1', downto: true, split: true }, 'C for downwards');
+  eq(t('for (i = 0; i < n; i += 2)').fields.init, '(i = 0; i < n; i += 2)'.slice(1, -1), 'other steps left as written');
+  eq(t('for i in range(1, n + 1):').fields, { init: 'i = 1', bound: 'n', downto: false, split: true }, 'Python range');
+  eq(t('for i in range(n):').fields, { init: 'i = 0', bound: 'n - 1', downto: false, split: true }, 'range(n)');
+  eq(t('for k in range(n, 0, -1):').fields, { init: 'k = n', bound: '1', downto: true, split: true }, 'range downwards');
+  eq(t('for v in G.V').kind, 'forall', 'for-in is still for each');
+  eq(t('parallel for i = 1 to n').fields.parallel, true, 'parallel for');
+  eq([t('loop').kind, t('switch (x) {').kind, t('switch (x) {').fields.cond], ['loop', 'switch', 'x'], 'loop / switch');
+  eq(t('case 1: y = 2').fields, { value: '1', rest: 'y = 2' }, 'case with a statement');
+  eq([t('default:').kind, t('case _:').kind], ['default', 'default'], 'default (and Python case _)');
+  eq(PS.typedLine('defaults = 3', { final: true }), null, 'defaults = 3 is a statement');
+  eq(PS.typedLine('loops = 0', { final: true }), null, 'loops = 0 is a statement');
+  eq(t('do {').kind, 'repeat', 'do { (pasted) is a repeat');
+  // Chinese keywords
+  eq(t('如果 x > 0 则').fields.cond, 'x > 0', '如果 … 则');
+  eq(t('否则如果 x < 0').kind, 'elseif', '否则如果');
+  eq([t('否则').kind, PS.typedLine('否则')], ['else', null], '否则 (waits while typing)');
+  eq(t('对于 i = 1 到 n').fields, { init: 'i = 1', bound: 'n', downto: false, split: true }, '对于 … 到');
+  eq(t('对于 i = n 递减到 1').fields.downto, true, '递减到');
+  eq(t('对每个 v ∈ V').kind, 'forall', '对每个');
+  eq(t('当 i > 0 时').fields.cond, 'i > 0', '当 … 时');
+  eq(PS.typedLine('当前节点 = x', { final: true }), null, '当前 is not while');
+  eq([t('重复').kind, t('直到 i > n').kind, t('返回 x').kind, t('跳出').kind, t('继续').kind], ['repeat', 'until', 'return', 'break', 'continue'], 'other Chinese keywords');
+  eq(t('过程 Insert(A, x)').fields, { kind: 'Procedure', name: 'Insert', args: 'A, x' }, '过程');
+  eq([t('输入：数组 A').kind, t('输出：A 已排序').kind, t('输出 x').kind], ['require', 'ensure', 'print'], '输入 / 输出');
+  eq(t('结束如果').kind, 'end', '结束如果');
+}
+
+// ---- 2.3: paste ----
+{
+  const pasted = (text) => PS.serializeLatex({ caption: '', nodes: PS.parsePasted(text).nodes }).split('\n').slice(2, -2).map((line) => line.trim());
+  eq(pasted('```python\nif x:\n    y = 1\n```'), ['\\If{$x$}', '\\State $y = 1$', '\\EndIf'], 'code fence dropped');
+  eq(pasted('if x > 0 then y = 1\nz = 2'), ['\\If{$x > 0$}', '\\State $y = 1$', '\\EndIf', '\\State $z = 2$'], 'one-line if … then');
+  eq(pasted('if x: return y\nz = 2'), ['\\If{$x$}', '\\Return $y$', '\\EndIf', '\\State $z = 2$'], 'Python one-line if');
+  eq(pasted('for (int i = 0; i < n; i++) {\n    if (a[i] > m)\n        m = a[i];\n    c++;\n}\nreturn m;'),
+    ['\\For{$i = 0$ \\To $n - 1$}', '\\If{$a[i] > m$}', '\\State $m = a[i]$', '\\EndIf', '\\State $c++$', '\\EndFor', '\\Return $m$'],
+    'C: an if without braces owns one statement');
+  eq(pasted('if (x > 0)\n    y = 1;\nelse\n    y = 2;\nz = 3;'), ['\\If{$x > 0$}', '\\State $y = 1$', '\\Else', '\\State $y = 2$', '\\EndIf', '\\State $z = 3$'], 'C if / else without braces');
+  eq(pasted('while (i < n)\n{\n    i++;\n}\nf();'), ['\\While{$i < n$}', '\\State $i++$', '\\EndWhile', '\\State $f()$'], 'Allman braces');
+  eq(pasted('do {\n  x--;\n} while (x > 0);'), ['\\Repeat', '\\State $x--$', '\\Until{$x \\le 0$}'], 'do-while: until with the condition negated');
+  eq(pasted('switch (x) {\n  case 1: y = 2; break;\n  default: y = 3;\n}'),
+    ['\\Switch{$x$}', '\\Case{$1$}', '\\State $y = 2$', '\\EndCase', '\\Default', '\\State $y = 3$', '\\EndCase', '\\EndSwitch'], 'C switch (trailing break dropped)');
+  eq(pasted('def f(A: list) -> int:\n    """Sort A."""\n    mid = (lo + hi) // 2\n    for i in range(1, len(A)):\n        pass\n    return None'),
+    ['\\Procedure{f}{$A$}', '\\State \\Comment{Sort A.}', '\\State $\\mathit{mid} = \\lfloor (\\mathit{lo} + \\mathit{hi}) / 2 \\rfloor$',
+      '\\For{$i = 1$ \\To $\\mathit{len}(A) - 1$}', '\\EndFor', '\\Return $\\textsc{nil}$', '\\EndProcedure'], 'Python: docstring, //, range, pass, None');
+  eq(pasted('while x > 0:\n    x -= 1\nelse:\n    print(x)')[3], '\\State \\Comment{if the loop above ended without break:}', 'while … else');
+  eq(pasted('if x > 0 then\nbegin\n  y := 1;\n  z := 2\nend\nelse\n  y := 0;'),
+    ['\\If{$x > 0$}', '\\State $y = 1$', '\\State $z = 2$', '\\Else', '\\State $y = 0$', '\\EndIf'], 'Pascal begin / end');
+  eq(pasted('int sum(int[] A) {\n  int s = 0;\n  return s;\n}'), ['\\Function{sum}{$A$}', '\\State $s = 0$', '\\Return $s$', '\\EndFunction'], 'C function, declaration type dropped');
+  eq(pasted('如果 x > 0\n    返回 x\n否则\n    返回 -x'), ['\\If{$x > 0$}', '\\Return $x$', '\\Else', '\\Return $-x$', '\\EndIf'], 'Chinese pseudocode');
+  eq(pasted('match c:\n    case 1:\n        a()\n    case _:\n        b()'),
+    ['\\Switch{$c$}', '\\Case{$1$}', '\\State $a()$', '\\EndCase', '\\Default', '\\State $b()$', '\\EndCase', '\\EndSwitch'], 'Python match');
+}
+
 done();

@@ -56,6 +56,33 @@ function locateFence(lines, source, hint) {
   return matches.reduce((best, fence) => (Math.abs(fence.start - hint) < Math.abs(best.start - hint) ? fence : best));
 }
 
+/** Any fenced code block (not only ```pseudo) around `line`: { start, end, prefix, language, source }. */
+function codeFenceAt(lines, line) {
+  for (let i = 0; i < lines.length; i++) {
+    const open = lines[i].match(/^((?:[ \t]*>)*[ \t]*)(`{3,}|~{3,})[ \t]*([^\s`]*)[^`]*$/);
+    if (!open) continue;
+    const prefix = open[1];
+    const depth = (prefix.match(/>/g) || []).length;
+    const marker = open[2];
+    const close = new RegExp(`^(?:[ \\t]*>){${depth}}[ \\t]*${marker[0] === '`' ? '`' : '~'}{${marker.length},}[ \\t]*$`);
+    const strip = depth ? new RegExp(`^(?:[ \\t]*>){${depth}} ?`) : new RegExp(`^[ \\t]{0,${prefix.length}}`);
+    let end = i + 1;
+    while (end < lines.length && !close.test(lines[end])) end++;
+    if (end >= lines.length) return null;
+    if (i <= line && line <= end) {
+      return {
+        start: i,
+        end,
+        prefix: depth ? prefix.replace(/[ \t]*$/, ' ') : prefix,
+        language: open[3].toLowerCase(),
+        source: lines.slice(i + 1, end).map((text) => text.replace(strip, '')).join('\n'),
+      };
+    }
+    i = end;
+  }
+  return null;
+}
+
 /** Replacement lines for a fence's content, re-applying its prefix. */
 function prefixed(latex, prefix) {
   return latex.split('\n').map((line) => (line || !prefix.trim() ? prefix + line : prefix.replace(/[ \t]+$/, '')));
@@ -153,13 +180,46 @@ class PseudocodeSuitePlugin extends Plugin {
         return true;
       },
     });
+    this.addCommand({
+      id: 'convert-to-pseudocode',
+      name: 'Convert selection or code block to pseudocode',
+      editorCheckCallback: (checking, editor, view) => {
+        const source = this.convertibleAt(editor);
+        if (checking) return !!source;
+        if (source) this.openConvert(editor, source, view);
+        return true;
+      },
+    });
+    this.addCommand({
+      id: 'copy-pseudocode-latex',
+      name: 'Copy pseudocode block as LaTeX',
+      editorCheckCallback: (checking, editor) => {
+        const fence = this.fenceAtCursor(editor);
+        if (checking) return !!fence;
+        if (fence) this.copyLatex(fence.source);
+        return true;
+      },
+    });
     this.registerEvent(this.app.workspace.on('editor-menu', (menu, editor, view) => {
       const fence = this.fenceAtCursor(editor);
-      if (!fence) return;
-      menu.addItem((item) => item
-        .setTitle('Edit pseudocode block')
-        .setIcon('square-pen')
-        .onClick(() => this.openEditorFence(editor, fence, view)));
+      if (fence) {
+        menu.addItem((item) => item
+          .setTitle('Edit pseudocode block')
+          .setIcon('square-pen')
+          .onClick(() => this.openEditorFence(editor, fence, view)));
+        menu.addItem((item) => item
+          .setTitle('Copy pseudocode as LaTeX')
+          .setIcon('copy')
+          .onClick(() => this.copyLatex(fence.source)));
+        return;
+      }
+      const source = this.convertibleAt(editor);
+      if (source) {
+        menu.addItem((item) => item
+          .setTitle(source.fence ? 'Convert code block to pseudocode' : 'Convert selection to pseudocode')
+          .setIcon('square-pen')
+          .onClick(() => this.openConvert(editor, source, view)));
+      }
     }));
   }
 
@@ -240,7 +300,18 @@ class PseudocodeSuitePlugin extends Plugin {
   }
 
   addEditButton(block, entry) {
-    const button = block.createEl('button', {
+    const bar = block.createDiv('ps-actions');
+    const copy = bar.createEl('button', {
+      cls: 'ps-edit-btn ps-copy-btn',
+      attr: { type: 'button', 'aria-label': 'Copy as LaTeX (algorithm + algpseudocode)' },
+    });
+    setIcon(copy.createSpan('ps-edit-icon'), 'copy');
+    copy.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.copyLatex(entry.source);
+    });
+    const button = bar.createEl('button', {
       cls: 'ps-edit-btn',
       attr: { type: 'button', 'aria-label': 'Edit in pseudocode builder' },
     });
@@ -255,12 +326,16 @@ class PseudocodeSuitePlugin extends Plugin {
     });
   }
 
+  copyLatex(source) {
+    PS.copyText(PS.exportLatex(PS.parseLatex(source)), 'LaTeX copied (the preamble it needs is in the comment on top)');
+  }
+
   /* ---------------- opening the builder ---------------- */
 
-  openBuilder(model, sourcePath, onSave) {
-    new PS.BuilderModal(this.app, {
+  openBuilder(model, sourcePath, onSave, options = {}) {
+    new PS.BuilderModal(this.app, Object.assign({
       model, settings: this.settings, sourcePath, onSave, saveSettings: (patch) => this.saveSettingsOnly(patch),
-    }).open();
+    }, options)).open();
   }
 
   /** Edit a block of a file on disk (reading view, live preview, embeds). */
@@ -268,6 +343,10 @@ class PseudocodeSuitePlugin extends Plugin {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) {
       new Notice(`File not found: ${path}`);
+      return;
+    }
+    if (file.extension === 'canvas') {
+      await this.openCanvasFence(file, source);
       return;
     }
     const fence = locateFence((await this.app.vault.read(file)).split(/\r?\n/), source, hint);
@@ -292,6 +371,102 @@ class PseudocodeSuitePlugin extends Plugin {
       if (!found) throw new Error('the block changed in the meantime');
       new Notice('Pseudocode updated');
     });
+  }
+
+  /**
+   * A block on a canvas card. Canvas files are JSON: the card's text is found by
+   * content and written back with only that string changed. An open canvas is
+   * updated through its view when it offers one, so it does not save over the change.
+   */
+  async openCanvasFence(file, source) {
+    const cardWith = (data) => (data.nodes || []).find((node) => node.type === 'text' && typeof node.text === 'string'
+      && locateFence(node.text.split(/\r?\n/), source, null));
+    let data;
+    try {
+      data = JSON.parse(await this.app.vault.read(file));
+    } catch (error) {
+      new Notice(`Could not read the canvas: ${error.message}`);
+      return;
+    }
+    const card = cardWith(data);
+    if (!card) {
+      new Notice('Could not find this pseudocode block on the canvas. Reopen it and try again.');
+      return;
+    }
+    const fence = locateFence(card.text.split(/\r?\n/), source, null);
+    this.openBuilder(PS.parseLatex(fence.source), file.path, async (latex) => {
+      const rewrite = (text) => {
+        const lines = text.split(/\r?\n/);
+        const current = locateFence(lines, fence.source, fence.start);
+        if (!current) return null;
+        return lines.slice(0, current.start + 1).concat(prefixed(latex, current.prefix), lines.slice(current.end)).join('\n');
+      };
+      // An open canvas keeps its own copy: change the card there.
+      const view = this.app.workspace.getLeavesOfType('canvas').map((leaf) => leaf.view)
+        .find((candidate) => candidate && candidate.file === file && candidate.canvas && candidate.canvas.nodes);
+      const live = view ? Array.from(view.canvas.nodes.values()).find((node) => node.id === card.id) : null;
+      if (live && typeof live.setText === 'function' && typeof live.text === 'string') {
+        const next = rewrite(live.text);
+        if (next == null) throw new Error('the block changed in the meantime');
+        live.setText(next);
+        if (typeof view.canvas.requestSave === 'function') view.canvas.requestSave();
+        new Notice('Pseudocode updated');
+        return;
+      }
+      let found = true;
+      await this.app.vault.process(file, (content) => {
+        const parsed = JSON.parse(content);
+        const node = (parsed.nodes || []).find((candidate) => candidate.id === card.id);
+        const next = node && typeof node.text === 'string' ? rewrite(node.text) : null;
+        if (next == null) {
+          found = false;
+          return content;
+        }
+        // Replace only the card's text, keeping Obsidian's formatting of the file.
+        const before = JSON.stringify(node.text);
+        if (content.includes(before)) return content.replace(before, () => JSON.stringify(next));
+        node.text = next;
+        return JSON.stringify(parsed, null, '\t');
+      });
+      if (!found) throw new Error('the block changed in the meantime');
+      new Notice('Pseudocode updated');
+    });
+  }
+
+  /** What "convert to pseudocode" would read: the selection, else the code block at the cursor. */
+  convertibleAt(editor) {
+    if (!editor) return null;
+    const selection = editor.getSelection();
+    if (selection && selection.trim()) {
+      return { text: selection, from: editor.getCursor('from'), to: editor.getCursor('to') };
+    }
+    const fence = codeFenceAt(editor.getValue().split(/\r?\n/), editor.getCursor().line);
+    if (!fence || fence.language === 'pseudo' || !fence.source.trim()) return null;
+    return { text: fence.source, fence };
+  }
+
+  /** Open the builder on pasted-style text; Save replaces it with a ```pseudo block. */
+  openConvert(editor, source, view) {
+    const parsed = PS.parsePasted(source.text);
+    const model = parsed.model || { caption: parsed.caption || '', nodes: parsed.nodes };
+    const path = view && view.file ? view.file.path : this.app.workspace.getActiveFile()?.path || '';
+    const original = source.text;
+    this.openBuilder(model, path, (latex) => {
+      if (source.fence) {
+        const lines = editor.getValue().split(/\r?\n/);
+        const current = codeFenceAt(lines, source.fence.start);
+        if (!current || current.source !== original) throw new Error('the code block changed in the meantime');
+        const marker = lines[current.start].match(/`{3,}|~{3,}/)[0];
+        const block = [`${current.prefix}${marker}pseudo`, ...prefixed(latex, current.prefix), `${current.prefix}${marker}`];
+        editor.replaceRange(block.join('\n'), { line: current.start, ch: 0 }, { line: current.end, ch: lines[current.end].length });
+      } else {
+        if (editor.getRange(source.from, source.to) !== original) throw new Error('the selection changed in the meantime');
+        const before = editor.getLine(source.from.line).slice(0, source.from.ch).trim() ? '\n' : '';
+        const after = editor.getLine(source.to.line).slice(source.to.ch).trim() ? '\n' : '';
+        editor.replaceRange(`${before}\`\`\`pseudo\n${latex}\n\`\`\`${after}`, source.from, source.to);
+      }
+      new Notice('Converted to pseudocode');
+    }, { dirty: true });
   }
 
   fenceAtCursor(editor) {

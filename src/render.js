@@ -59,13 +59,14 @@
     if (isMath && !text.includes('$')) {
       // Constants and booleans are text, not a product of variables.
       if (/^[A-Z]{2,}[A-Z0-9_-]*$/.test(text) || /^(true|false)$/i.test(text)) return `\\textsc{${text.toLowerCase()}}`;
+      const plain = !text.includes('\\');
       const math = (segment) => {
-        const tex = PS.normalizeExpr(segment);
+        const tex = plain ? PS.plainMath(segment) : PS.normalizeExpr(segment);
         return comparison ? asComparison(tex) : tex;
       };
-      const plain = PS.normalizeOperators(text);
+      const source = PS.normalizeOperators(text);
       // Merge-Sort(A, p, r) inside an expression renders like \Call.
-      return PS.inlineWithCalls(plain, math) || `$${math(plain)}$`;
+      return PS.inlineWithCalls(source, math) || `$${math(source)}$`;
     }
     // Conditions mixing text and math ($a = b$ and $c$): `=` still means `==`.
     if (comparison) return text.replace(/\$([^$]*)\$/g, (all, inner) => `$${asComparison(inner)}$`);
@@ -325,22 +326,31 @@
 
   const MERGEABLE = new Set(['state', 'call', 'return', 'print', 'break', 'continue']);
 
+  /** A line's `\label` and highlight, kept on the row for `\ref` and styling. */
+  const meta = (holder, prefix = '') => ({
+    label: holder ? holder[PS.metaKey(prefix, 'label')] || null : null,
+    mark: !!(holder && holder[PS.metaKey(prefix, 'mark')]),
+  });
+
   function buildRows(nodes, depth, counter, rows) {
-    const row = (text, comment, numbered = true, extra = {}) => rows.push(Object.assign({
-      number: numbered ? ++counter.value : null,
-      depth,
-      text,
-      comment: comment || null,
-    }, extra));
+    const row = (text, comment, numbered = true, extra = {}) => {
+      if (numbered) counter.started = true;
+      rows.push(Object.assign({
+        number: numbered ? ++counter.value : null,
+        depth,
+        text,
+        comment: comment || null,
+      }, extra));
+    };
     const body = (list) => buildRows(list || [], depth + 1, counter, rows);
 
     for (const node of nodes) {
       switch (node.type) {
         case 'function': {
-          row(`\\fn{${node.name || ''}}(${expr(node.args, node.argsMath)})`, node.comment, false, { kind: 'function' });
-          // Each procedure numbers its own lines from 1.
+          row(`\\fn{${node.name || ''}}(${expr(node.args, node.argsMath)})`, node.comment, false, Object.assign({ kind: 'function' }, meta(node)));
+          // Each procedure numbers its own lines from 1 (a block's start option counts for the first).
           const saved = counter.value;
-          counter.value = 0;
+          if (counter.started) counter.value = 0;
           body(node.body);
           counter.value = saved;
           break;
@@ -349,18 +359,20 @@
         case 'if': {
           node.branches.forEach((branch, index) => {
             const comment = index === 0 ? node.comment || branch.comment : branch.comment;
-            row(`\\kw{${index === 0 ? 'if' : 'elseif'}} ${expr(branch.cond, branch.condMath, true)}`, comment);
+            row(`\\kw{${index === 0 ? 'if' : 'elseif'}} ${expr(branch.cond, branch.condMath, true)}`, comment, true, meta(index === 0 ? node : branch));
             body(branch.body);
           });
           if (node.elseBody) {
             // CLRS: a plain first statement goes on the else line ("else x = x.right"),
             // the rest of the branch below it.
             const [first, ...rest] = node.elseBody;
-            if (first && MERGEABLE.has(first.type) && !(first.comment && node.elseComment)) {
-              row(`\\kw{else} ${simpleText(first)}`, node.elseComment || first.comment);
+            const elseMeta = meta(node, 'else');
+            if (first && MERGEABLE.has(first.type) && !(first.comment && node.elseComment)
+              && !elseMeta.label && !first.label && elseMeta.mark === !!first.mark) {
+              row(`\\kw{else} ${simpleText(first)}`, node.elseComment || first.comment, true, elseMeta);
               body(rest);
             } else {
-              row('\\kw{else}', node.elseComment);
+              row('\\kw{else}', node.elseComment, true, elseMeta);
               body(node.elseBody);
             }
           }
@@ -368,12 +380,13 @@
         }
 
         case 'while':
-          row(`\\kw{while} ${expr(node.cond, node.condMath, true)}`, node.comment);
+          row(`\\kw{while} ${expr(node.cond, node.condMath, true)}`, node.comment, true, meta(node));
           body(node.body);
           break;
 
         case 'for': {
           let head;
+          const keyword = node.parallel && !node.all ? '\\kw{parallel for}' : '\\kw{for}';
           if (node.all) {
             // CLRS: "**for** each v ∈ G.V" (only "for" is bold). A head already written with text commands
             // (\texttt{child} of \texttt{u}) is prose; math mode would swallow its spaces.
@@ -390,40 +403,68 @@
             }
           } else {
             head = node.bound
-              ? `\\kw{for} ${expr(node.init, node.initMath)} \\kw{${node.downto ? 'downto' : 'to'}} ${expr(node.bound, node.boundMath)}`
-              : `\\kw{for} ${expr(node.init, node.initMath)}`;
+              ? `${keyword} ${expr(node.init, node.initMath)} \\kw{${node.downto ? 'downto' : 'to'}} ${expr(node.bound, node.boundMath)}`
+              : `${keyword} ${expr(node.init, node.initMath)}`;
           }
-          row(head, node.comment);
+          row(head, node.comment, true, meta(node));
           body(node.body);
           break;
         }
 
         case 'repeat':
-          row('\\kw{repeat}', node.comment);
+          row('\\kw{repeat}', node.comment, true, meta(node));
           body(node.body);
-          row(`\\kw{until} ${expr(node.until, node.untilMath, true)}`, node.untilComment);
+          row(`\\kw{until} ${expr(node.until, node.untilMath, true)}`, node.untilComment, true, meta(node, 'until'));
+          break;
+
+        case 'loop':
+          row('\\kw{loop}', node.comment, true, meta(node));
+          body(node.body);
+          break;
+
+        case 'switch':
+          row(`\\kw{switch} ${expr(node.cond, node.condMath)}`, node.comment, true, meta(node));
+          body(node.body);
+          break;
+
+        case 'case':
+          row(node.default ? '\\kw{default}' : `\\kw{case} ${expr(node.value, node.valueMath)}`, node.comment, true, meta(node));
+          body(node.body);
           break;
 
         case 'state':
           // CLRS numbers comment lines too.
-          if (!node.text && node.comment) row('', node.comment, true, { note: true });
-          else row(simpleText(node), node.comment);
+          if (!node.text && node.comment) row('', node.comment, true, Object.assign({ note: true }, meta(node)));
+          else row(simpleText(node), node.comment, true, meta(node));
           break;
+
+        case 'statex':
+          // \Statex: an unnumbered line (blank, or a heading).
+          row(expr(node.text, node.textMath), node.comment, false, Object.assign({ kind: 'statex' }, meta(node)));
+          break;
+
+        case 'counter': {
+          // \setcounter{ALG@line}{k}: the next line is numbered k + 1.
+          const next = parseInt(node.value, 10);
+          if (next >= 1) counter.value = next - 1;
+          counter.started = true;
+          break;
+        }
 
         case 'require':
         case 'ensure':
-          row(`\\kw{${node.type === 'require' ? 'Require' : 'Ensure'}:} ${expr(node.text, node.textMath)}`, node.comment, false);
+          row(`\\kw{${node.type === 'require' ? 'Require' : 'Ensure'}:} ${expr(node.text, node.textMath)}`, node.comment, false, meta(node));
           break;
 
         case 'comment': {
           const last = rows[rows.length - 1];
           if (last && !last.comment) last.comment = node.text || '';
-          else row('', node.text || '', true, { note: true });
+          else row('', node.text || '', true, Object.assign({ note: true }, meta(node)));
           break;
         }
 
         default:
-          row(simpleText(node) || '', node.comment);
+          row(simpleText(node) || '', node.comment, true, meta(node));
       }
     }
   }
@@ -516,13 +557,25 @@
 
   PS.buildRows = function buildRowsForModel(model) {
     const rows = [];
-    buildRows(model.nodes || [], 0, { value: 0 }, rows);
+    const start = parseInt(model.start, 10);
+    buildRows(model.nodes || [], 0, { value: start > 1 ? start - 1 : 0, started: false }, rows);
+    // \ref{name} → the number of the line carrying \label{name}.
+    const numbers = new Map(rows.filter((row) => row.label).map((row) => [row.label, row.number]));
+    const resolve = (text) => (text && text.includes('\\ref')
+      ? text.replace(/\\ref\{([^{}]*)\}/g, (all, name) => (numbers.get(name) != null ? String(numbers.get(name)) : '??'))
+      : text);
+    rows.forEach((row) => {
+      row.text = resolve(row.text);
+      row.comment = resolve(row.comment);
+    });
     return rows;
   };
 
   /** AST → DOM. Math is left as `.ps-math` placeholders for PS.typesetMath. */
   PS.renderBlock = function renderBlock(model, options) {
     const settings = Object.assign({ lineNumbers: true, indentSize: '1.2em', commentDelimiter: '//' }, options || {});
+    // Per-block option: \begin{algorithmic}[0] / [1].
+    if (typeof model.numbers === 'boolean') settings.lineNumbers = model.numbers;
     const block = el('div', 'ps-block');
     block.setCssProps({ '--ps-indent': settings.indentSize || '1.2em' });
 
@@ -546,6 +599,7 @@
       if (row.kind) lineClasses.push(`ps-row-${row.kind}`);
       if (row.kind === 'function' && index > 0) lineClasses.push('ps-fn-later');
       if (index > 0 && rows[index - 1].kind === 'function') lineClasses.push('ps-after-fn');
+      if (row.mark) lineClasses.push('ps-mark');
       const cell = (className, text) => {
         const node = el('span', className, text);
         lineClasses.forEach((name) => node.classList.add(name));

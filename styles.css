@@ -114,6 +114,17 @@
   padding-left: calc(var(--ps-indent) * var(--ps-depth, 0));
 }
 
+/* Highlighted line (`% highlight`): every cell, with the column gaps filled in. */
+.ps-block .ps-mark {
+  background-color: var(--text-highlight-bg, rgba(255, 208, 0, 0.4));
+  box-shadow: -0.45em 0 0 var(--text-highlight-bg, rgba(255, 208, 0, 0.4)), 0.45em 0 0 var(--text-highlight-bg, rgba(255, 208, 0, 0.4));
+}
+
+/* A blank \Statex line keeps its height. */
+.ps-code.ps-row-statex:empty::before {
+  content: '\200b';
+}
+
 /* Procedure header: leads its body, with air before each later procedure. */
 .ps-fn-later {
   padding-top: 0.8em;
@@ -186,11 +197,17 @@
 
 /* Edit button on rendered blocks */
 
-.ps-edit-btn {
+/* Copy-as-LaTeX and Edit, top right of a rendered block. */
+.ps-actions {
   position: absolute;
   top: 6px;
   right: 6px;
   z-index: 4;
+  display: flex;
+  gap: 2px;
+}
+
+.ps-edit-btn {
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -220,7 +237,7 @@
 }
 
 /* Live Preview puts its own </> button in the top-right corner. */
-.markdown-source-view .cm-embed-block .ps-edit-btn {
+.markdown-source-view .cm-embed-block .ps-actions {
   top: -4px;
   right: 42px;
 }
@@ -230,7 +247,7 @@
 }
 
 @media print {
-  .ps-block .ps-edit-btn {
+  .ps-block .ps-actions {
     display: none;
   }
 }
@@ -414,8 +431,37 @@ input.ps-invalid {
 .pb-chip-while,
 .pb-chip-for,
 .pb-chip-repeat,
-.pb-chip-until {
+.pb-chip-until,
+.pb-chip-loop,
+.pb-chip-switch,
+.pb-chip-case {
   color: var(--text-accent);
+}
+
+/* A highlighted line (% highlight) in the builder. */
+.pb-row.pb-marked {
+  background-color: var(--text-highlight-bg, rgba(255, 208, 0, 0.25));
+}
+
+/* Block options under the title: numbering and the first line number. */
+.pb-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 0 0 6px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+
+.pb-options label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pb-options input.pb-start {
+  width: 4.5em;
 }
 
 .pb-chip-function {

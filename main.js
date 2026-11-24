@@ -40,7 +40,7 @@ PS.node = function node(type, fields) {
   return Object.assign({ id: PS.nextId(), type }, fields || {});
 };
 
-PS.CONTAINERS = new Set(['if', 'while', 'for', 'repeat', 'function']);
+PS.CONTAINERS = new Set(['if', 'while', 'for', 'repeat', 'function', 'loop', 'switch', 'case']);
 PS.isContainer = (node) => PS.CONTAINERS.has(node.type);
 
 /** Every statement list directly owned by `node` (if: branches, then else). */
@@ -124,6 +124,8 @@ const OPERATOR_ALIASES = [
   [/<>/g, '!='],
   [/&&/g, 'and'],
   [/\|\|/g, 'or'],
+  // C / Python negation `!done`, `!(a and b)`; a factorial `n!` and `!=` stay.
+  [/(^|[\s(])!(?=[A-Za-z(])/g, '$1not '],
   [/\\(?:And|AND)\b/g, 'and'],
   [/\\(?:Or|OR)\b/g, 'or'],
   [/\\(?:Not|NOT)\b/g, 'not'],
@@ -137,6 +139,7 @@ const SYMBOL_TEX = [
   [/>=/g, '\\ge '],
   [/!=/g, '\\ne '],
   [/->/g, '\\to '],
+  [/∞/g, '\\infty '],
   [/(\s*)\.\.(?!\.)\s*/g, (match, space, offset, text) => (/[.\\]/.test(text[offset + space.length - 1] || '') ? match : ' \\twodots ')],
 ];
 const WORD_TEX = [
@@ -202,7 +205,61 @@ function splitComment(text) {
   return { body: match[1], comment: match[2] };
 }
 
-const countDollars = (value) => (value.match(/\$/g) || []).length;
+/** Math delimiters in `value`; an escaped `\$` is a dollar sign, not a delimiter. */
+function countDollars(value) {
+  let count = 0;
+  for (let i = 0; i < value.length; i++) {
+    if (value[i] === '\\') i++;
+    else if (value[i] === '$') count++;
+  }
+  return count;
+}
+
+/*
+ * Characters TeX treats as syntax. In a builder field written without any LaTeX they
+ * mean themselves (`i % 2`, `S ∪ {u}`, `heap_size`, `cost $5`), so they are escaped on
+ * the way into math and unescaped on the way back.
+ */
+const ESCAPED_SPECIAL = /\\([%&#{}$_])/g;
+
+/** `heap_size` (two or more letters before `_`) is one name, not heap with subscript s. */
+const SNAKE_NAME = /(^|[^\\A-Za-z0-9])([A-Za-z][A-Za-z0-9]+(?:_[A-Za-z0-9]+)+)(?![A-Za-z0-9({])/g;
+
+/** Plain builder text → text safe inside `$...$` (no-op for text already written in LaTeX). */
+function escapePlain(text) {
+  const value = String(text == null ? '' : text);
+  if (value.includes('\\')) return value;
+  // Braces right after ^ or _ group a superscript or subscript (n^{k+1}): TeX, kept.
+  let out = '';
+  const groups = [];
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (ch === '{' && /[\^_]/.test(value[i - 1] || '')) {
+      groups.push(true);
+      out += ch;
+    } else if (ch === '{') {
+      groups.push(false);
+      out += '\\{';
+    } else if (ch === '}') {
+      out += groups.pop() ? '}' : '\\}';
+    } else {
+      out += /[%&#$]/.test(ch) ? `\\${ch}` : ch;
+    }
+  }
+  return out.replace(SNAKE_NAME, (all, before, name) => `${before}\\mathit{${name.replace(/_/g, '\\_')}}`);
+}
+
+/** The reverse, when nothing but escaped specials carries a backslash. */
+function unescapePlain(text) {
+  const value = String(text == null ? '' : text);
+  if (!value.includes('\\')) return value;
+  const plain = value
+    .replace(/\\mathit\{([A-Za-z][A-Za-z0-9]*(?:\\_[A-Za-z0-9]+)+)\}/g, '$1')
+    .replace(ESCAPED_SPECIAL, '$1');
+  return plain.includes('\\') ? value : plain;
+}
+PS.escapePlain = escapePlain;
+PS.unescapePlain = unescapePlain;
 
 function isSingleMath(text) {
   const value = String(text == null ? '' : text).trim();
@@ -241,7 +298,8 @@ function fromMath(text) {
       .replace(/\\textsc\{([a-z]+)\}/g, (all, word) => word.toUpperCase())
       .replace(/\u0002(\d+)\u0003/g, (all, index) => kept[Number(index)]);
   };
-  value = value.includes('$')
+  const mixed = countDollars(value) > 0;
+  value = mixed
     ? value.split(/(\$[^$]*\$)/).map((chunk, index) => (index % 2 ? unwrap(chunk) : chunk)).join('')
     // Prose without any math (`\Return \textbf{true}`) keeps its fonts as written.
     : single ? unwrap(value) : value;
@@ -250,8 +308,24 @@ function fromMath(text) {
     .replace(/\\textbackslash\b/g, '\\')
     .replace(/\\_/g, '_')
     .replace(/\\[,;: ]/g, ' ');
+  // In math, the builder's spellings of what normalizeExpr writes as TeX.
+  if (single || mixed) value = plainFunctions(value);
   // `\State \text{}` is the empty placeholder of a comment-only line.
-  return value.replace(/\\text\{\}/g, '').replace(/[ \t]+/g, ' ').trim();
+  value = value.replace(/\\text\{\}/g, '').replace(/[ \t]+/g, ' ').trim();
+  return mixed ? value : unescapePlain(value);
+}
+
+/** `\lfloor n/2 \rfloor` → `floor(n/2)`, `\sqrt{n}` → `sqrt(n)`, `\infty` → `∞` (see normalizeExpr). */
+function plainFunctions(text) {
+  let value = text;
+  for (let previous = null; previous !== value;) {
+    previous = value;
+    value = value
+      .replace(/(^|[^t])\\lfloor\s*((?:(?!\\[lr]floor)[\s\S])*?)\s*\\rfloor/g, (all, before, inner) => `${before}floor(${inner})`)
+      .replace(/(^|[^t])\\lceil\s*((?:(?!\\[lr]ceil)[\s\S])*?)\s*\\rceil/g, (all, before, inner) => `${before}ceil(${inner})`)
+      .replace(/\\sqrt\{([^{}]*)\}/g, 'sqrt($1)');
+  }
+  return value.replace(/\\infty\b\s?/g, '∞');
 }
 
 PS.readGroup = readGroup;
@@ -279,10 +353,12 @@ PS.isSingleMath = isSingleMath;
 const precededBy = (text, index, pattern) => index > 0 && pattern.test(text[index - 1]);
 const CALL_AT = /([A-Z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*)\(/g;
 const isCallName = (name) => /^[A-Z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*$/.test(name) && (name.match(/[A-Za-z]/g) || []).length >= 2;
-const LOGIC_WORD = /(and|or|not)(?![A-Za-z0-9_])/g;
+const LOGIC_WORD = /(and|or|not|spawn|sync)(?![A-Za-z0-9_])/g;
+// CLRS's multithreading keywords (spawn, sync) are bold, like error.
+const BOLD_WORDS = new Set(['error', 'spawn', 'sync']);
 // `\textbf{and}` is how older notes wrote them; read, and saved back as plain words.
-const LOGIC_TEX = /^\\textbf\{(and|or|not|error)\}/;
-const LOGIC_PLAIN = /^(and|or|not)(?![A-Za-z0-9_])/;
+const LOGIC_TEX = /^\\textbf\{(and|or|not|error|spawn|sync)\}/;
+const LOGIC_PLAIN = /^(and|or|not|spawn|sync)(?![A-Za-z0-9_])/;
 // Quoted strings stay text, with typographic quotes: error “heap underflow”.
 const STRING = /(“[^”]*”|"[^"]*")/;
 
@@ -362,7 +438,7 @@ function inlineWithCalls(text, mathFn) {
   };
   return parts.map((part) => {
     if (part.type === 'call') return `\\Call{${part.name}}{${inlineWithCalls(part.args, mathFn) || math(part.args).trim()}}`;
-    if (part.type === 'keyword') return part.value === 'error' ? '\\textbf{error}' : part.value;
+    if (part.type === 'keyword') return BOLD_WORDS.has(part.value) ? `\\textbf{${part.value}}` : part.value;
     if (part.type === 'string') return `“${part.value}”`;
     return math(part.value);
   }).join('').trim();
@@ -446,12 +522,12 @@ PS.callsToPlain = callsToPlain;
 
 // Lines whose own `{...}` groups must not swallow a trailing \Comment.
 const COMMENTABLE = new Set([
-  'Function', 'Procedure', 'If', 'Elif', 'ElsIf', 'ElseIf', 'Else', 'While', 'For', 'ForAll', 'Repeat', 'Until',
-  'Call', 'Break', 'Continue',
+  'Function', 'Procedure', 'If', 'Elif', 'ElsIf', 'ElseIf', 'Else', 'While', 'For', 'ForAll', 'ForEach', 'ParFor',
+  'Repeat', 'Until', 'Loop', 'Switch', 'Case', 'Default', 'Call', 'Break', 'Continue',
 ]);
 
 // Fields that may be calls, constants or math joined by logic words.
-const LOGIC_SOURCE = /\\Call\b|\\textbf\{(?:and|or|not|error)\}|\\textsc\{|(?:^|\$)\s*(?:and|or|not)\s+\$/;
+const LOGIC_SOURCE = /\\Call\b|\\textbf\{(?:and|or|not|error|spawn|sync)\}|\\textsc\{|(?:^|\$)\s*(?:and|or|not)\s+\$/;
 
 /** `{ field: value, fieldMath: wasSingleMath }` for a math-carrying field. */
 function mathField(name, raw) {
@@ -487,29 +563,106 @@ function logicalLines(source) {
   return lines;
 }
 
+/*
+ * Per-line extras kept on whatever owns the line: `\label{…}` (for `\ref{…}` and
+ * LaTeX export) and a trailing `% highlight` mark. A node keeps them as `label` /
+ * `mark`; an if's else line and a repeat's until line as `elseLabel`, `untilMark` ….
+ */
+const metaKey = (prefix, name) => (prefix ? `${prefix}${name[0].toUpperCase()}${name.slice(1)}` : name);
+PS.metaKey = metaKey;
+
+/** Take `\label{…}` and a trailing `% highlight` off a line. */
+function splitLineMeta(line) {
+  let text = line;
+  let mark = false;
+  const highlight = text.match(/(^|[^\\])%\s*highlight\s*$/i);
+  if (highlight) {
+    text = text.slice(0, highlight.index + highlight[1].length).trimEnd();
+    mark = true;
+  }
+  let label = null;
+  text = text.replace(/\s*\\label\{([^{}]*)\}/, (all, name) => {
+    label = name;
+    return '';
+  }).trim();
+  return { text, label, mark };
+}
+
+// End commands → the container type they close.
+const END_OF = {
+  EndFunction: 'function', EndProcedure: 'function', EndIf: 'if', EndWhile: 'while',
+  EndFor: 'for', EndParFor: 'for', EndForAll: 'for', EndForEach: 'for', EndLoop: 'loop',
+  EndSwitch: 'switch', EndCase: 'case', EndDefault: 'case',
+};
+
 PS.parseLatex = function parseLatex(source) {
   const model = { caption: '', nodes: [] };
   const stack = [{ target: model.nodes, node: null }];
   const top = () => stack[stack.length - 1];
-  const push = (node) => top().target.push(node);
+  // What the line just read belongs to, for a `\label` on a line of its own.
+  let lastLine = null;
+  const own = (holder, prefix) => { lastLine = { holder, prefix }; };
+  const push = (node) => {
+    top().target.push(node);
+    own(node, '');
+  };
   const open = (node, target) => {
     push(node);
     stack.push({ target, node });
   };
-  const pop = () => {
-    if (stack.length > 1) stack.pop();
+  /** Close the innermost open block of `type` (and anything left open inside it). */
+  const closeTo = (type) => {
+    for (let i = stack.length - 1; i > 0; i--) {
+      if (stack[i].node.type === type) {
+        stack.length = i;
+        return true;
+      }
+    }
+    return false; // nothing of that kind is open: a stray end changes nothing
+  };
+  /** The innermost open block of `type`, made the top of the stack (null if none). */
+  const reopen = (type) => {
+    for (let i = stack.length - 1; i > 0; i--) {
+      if (stack[i].node.type === type) {
+        stack.length = i + 1;
+        return stack[i].node;
+      }
+    }
+    return null;
   };
 
   for (const rawLine of logicalLines(source)) {
-    const line = rawLine.trim();
-    if (!line) continue;
+    const meta = splitLineMeta(rawLine.trim());
+    const line = meta.text;
+    const applyMeta = () => {
+      if (!lastLine) return;
+      if (meta.label != null) lastLine.holder[metaKey(lastLine.prefix, 'label')] = meta.label;
+      if (meta.mark) lastLine.holder[metaKey(lastLine.prefix, 'mark')] = true;
+    };
+    if (!line) {
+      applyMeta(); // `\label{…}` alone: names the line above
+      continue;
+    }
+    const options = line.match(/^\\begin\{algorithmic\}\s*(?:\[\s*(\d+)\s*\])?/);
+    if (options) {
+      if (options[1] != null) model.numbers = Number(options[1]) > 0;
+      continue;
+    }
     if (/^\\(?:[Bb]egin|[Ee]nd)\{algorithm(?:ic)?\}/.test(line)) continue;
-    if (/^\\label\{/.test(line)) continue;
+    // algorithmicx line numbering: `\setcounter{ALG@line}{4}` → the next line is 5.
+    const counter = line.match(/^(?:\\makeatletter\s*)?\\setcounter\{ALG@line\}\{\s*(\d+)\s*\}(?:\s*\\makeatother)?$/);
+    if (counter) {
+      const next = Number(counter[1]) + 1;
+      if (!model.nodes.length && stack.length === 1) model.start = next;
+      else push(PS.node('counter', { value: String(next) }));
+      continue;
+    }
 
     const match = line.match(/^\\([A-Za-z]+)([\s\S]*)$/);
     if (!match) {
       const { body, comment } = splitComment(line);
       push(withComment(PS.node('raw', { text: body.trim() }), comment));
+      applyMeta();
       continue;
     }
     const name = match[1];
@@ -548,19 +701,21 @@ PS.parseLatex = function parseLatex(source) {
       case 'Elif':
       case 'ElsIf':
       case 'ElseIf': {
-        const { node } = top();
-        if (!node || node.type !== 'if') break;
+        const node = reopen('if');
+        if (!node) break;
         const branch = withComment(Object.assign(conditionField('cond', group ? group.value : ''), { body: [] }), lineComment);
         node.branches.push(branch);
         stack[stack.length - 1] = { target: branch.body, node };
+        own(branch, '');
         break;
       }
       case 'Else': {
-        const { node } = top();
-        if (!node || node.type !== 'if') break;
+        const node = reopen('if');
+        if (!node) break;
         node.elseBody = [];
         if (lineComment !== null) node.elseComment = lineComment;
         stack[stack.length - 1] = { target: node.elseBody, node };
+        own(node, 'else');
         break;
       }
 
@@ -570,13 +725,15 @@ PS.parseLatex = function parseLatex(source) {
         break;
       }
 
-      case 'ForAll': {
+      case 'ForAll':
+      case 'ForEach': {
         const clean = fromMath(group ? group.value : '').replace(/\$/g, '').trim();
         const node = PS.node('for', { all: true, init: clean, initMath: false, bound: '', body: [] });
         open(withComment(node, lineComment), node.body);
         break;
       }
-      case 'For': {
+      case 'For':
+      case 'ParFor': {
         const content = group ? group.value : '';
         const parts = content.split(/\s*(?:\\textbf\{(?:to|downto)\}|\\To\b|\\DownTo\b|\bto\b|\bdownto\b)\s*/i);
         const bound = parts.length > 1 ? parts.slice(1).join('') : '';
@@ -585,6 +742,29 @@ PS.parseLatex = function parseLatex(source) {
           parts.length > 1 ? mathField('bound', bound) : { bound: '', boundMath: false },
           { downto: /\bDownTo\b/i.test(content), body: [] },
         ));
+        if (name === 'ParFor') node.parallel = true;
+        open(withComment(node, lineComment), node.body);
+        break;
+      }
+
+      case 'Loop': {
+        const node = PS.node('loop', { body: [] });
+        open(withComment(node, lineComment), node.body);
+        break;
+      }
+
+      case 'Switch': {
+        const node = PS.node('switch', Object.assign(mathField('cond', group ? group.value : ''), { body: [] }));
+        open(withComment(node, lineComment), node.body);
+        break;
+      }
+      case 'Case':
+      case 'Default': {
+        // A case ends where the next one starts, even without \EndCase.
+        if (top().node && top().node.type === 'case') stack.pop();
+        const node = name === 'Default'
+          ? PS.node('case', { default: true, value: '', body: [] })
+          : PS.node('case', Object.assign(mathField('value', group ? group.value : ''), { body: [] }));
         open(withComment(node, lineComment), node.body);
         break;
       }
@@ -595,11 +775,12 @@ PS.parseLatex = function parseLatex(source) {
         break;
       }
       case 'Until': {
-        const { node } = top();
-        if (!node || node.type !== 'repeat') break;
+        const node = reopen('repeat');
+        if (!node) break;
         Object.assign(node, conditionField('until', group ? group.value : ''));
         if (lineComment !== null) node.untilComment = lineComment;
-        pop();
+        stack.pop();
+        own(node, 'until');
         break;
       }
 
@@ -608,7 +789,14 @@ PS.parseLatex = function parseLatex(source) {
       case 'EndIf':
       case 'EndWhile':
       case 'EndFor':
-        pop();
+      case 'EndParFor':
+      case 'EndForAll':
+      case 'EndForEach':
+      case 'EndLoop':
+      case 'EndSwitch':
+      case 'EndCase':
+      case 'EndDefault':
+        closeTo(END_OF[name]);
         break;
 
       case 'State': {
@@ -667,19 +855,25 @@ PS.parseLatex = function parseLatex(source) {
         const array = top().target;
         const previous = array[array.length - 1];
         if (previous && !previous.comment) previous.comment = text;
-        else array.push(PS.node('comment', { text }));
+        else push(PS.node('comment', { text }));
         break;
       }
 
-      case 'Statex':
-        // \Statex is a blank spacing line in algorithmicx; render nothing.
+      case 'Statex': {
+        // An unnumbered line: blank, or a heading such as \Statex \textbf{Phase 1}.
+        const { body, comment } = splitComment(rest);
+        const node = PS.node('statex', mathField('text', body.trim()));
+        if (!node.text) node.textMath = false;
+        push(withComment(node, comment));
         break;
+      }
 
       default: {
         const { body, comment } = splitComment(line);
         push(withComment(PS.node('raw', { text: body.trim() }), comment));
       }
     }
+    applyMeta();
   }
   return model;
 };
@@ -724,9 +918,46 @@ function endsWithPhraseWord(before) {
   return !(/[A-Za-z0-9]/.test(tail[0][0]) && inCommand(before, tail.index));
 }
 
+/** `floor(x)` → ⌊x⌋, `ceil(x)` → ⌈x⌉, `sqrt(x)` → √x, `abs(x)` → |x| (nested calls too). */
+const MATH_WRAPPERS = {
+  floor: (inner) => `\\lfloor ${inner} \\rfloor`,
+  ceil: (inner) => `\\lceil ${inner} \\rceil`,
+  sqrt: (inner) => `\\sqrt{${inner}}`,
+  abs: (inner) => `\\lvert ${inner} \\rvert`,
+};
+function wrapFunctions(text) {
+  const pattern = /(floor|ceil|sqrt|abs)\s*\(/g;
+  let out = '';
+  let last = 0;
+  for (let match; (match = pattern.exec(text));) {
+    if (precededBy(text, match.index, /[\\A-Za-z0-9_.]/)) continue;
+    const open = match.index + match[0].length - 1;
+    let depth = 0;
+    let close = -1;
+    for (let i = open; i < text.length && close < 0; i++) {
+      if (text[i] === '(') depth += 1;
+      else if (text[i] === ')' && --depth === 0) close = i;
+    }
+    if (close < 0) break;
+    out += text.slice(last, match.index) + MATH_WRAPPERS[match[1]](wrapFunctions(text.slice(open + 1, close).trim()));
+    last = close + 1;
+    pattern.lastIndex = last;
+  }
+  return out + text.slice(last);
+}
+
+/** Python's `n**2`, `2 ** (k + 1)` → a superscript. */
+const powers = (text) => text.replace(/\s*\*\*\s*(\([^()]*\)|-?[A-Za-z0-9.]+)/g, (all, operand) => `^{${operand.replace(/^\((.*)\)$/, '$1')}}`);
+
+/** A builder field written without LaTeX → math: TeX specials escaped, then normalizeExpr. */
+function plainMath(segment) {
+  return normalizeExpr(escapePlain(segment));
+}
+PS.plainMath = plainMath;
+
 function normalizeExpr(expr) {
   const out = PS.maskFontGroups(expr, (masked) => {
-    const words = masked
+    const words = powers(wrapFunctions(masked))
       .replace(/([A-Za-z])_\{(\d+)\}/g, subscript)
       .replace(/([A-Za-z])_?(\d+)/g, subscript)
       .replace(/([A-Za-z])-([A-Za-z])/g, '$1\\text{-}$2')
@@ -735,6 +966,9 @@ function normalizeExpr(expr) {
         const before = text.slice(0, offset);
         const after = text.slice(offset + word.length);
         if (/^[A-Z]{2,}$/.test(word) || /^(true|false)$/i.test(word)) return constantTex(word);
+        // Python None, Java null and a lower-case nil are all CLRS's NIL.
+        if (/^(nil|null|None)$/.test(word)) return constantTex('nil');
+        if (/^(inf|infinity|Infinity)$/.test(word)) return '\\infty';
         if (KEYWORD_WORDS.has(word)) return word;
         if (word === 'mod') return '\\bmod';
         if (MATH_FUNCTIONS.has(word)
@@ -762,10 +996,13 @@ function toMath(raw) {
   if (isSingleMath(expr)) expr = expr.slice(1, -1).trim();
   if (!expr) return '';
   // CJK prose must stay outside math mode.
-  if (/[一-鿿]/.test(expr)) return expr;
+  if (/[一-鿿]/.test(expr)) return escapeProse(expr);
   if (expr.includes('\\')) return `$${normalizeExpr(expr)}$`;
-  return inlineWithCalls(expr, normalizeExpr) || `$${normalizeExpr(expr)}$`;
+  return inlineWithCalls(expr, plainMath) || `$${plainMath(expr)}$`;
 }
+
+/** Prose (text outside math) written without LaTeX: `%`, `&`, `#` are characters, not syntax. */
+const escapeProse = (text) => (/\\/.test(text) ? text : text.replace(/[%&#{}$_]/g, (ch) => `\\${ch}`));
 
 /**
  * Serialize one field. `isMath === false` marks text that was prose in the
@@ -775,13 +1012,15 @@ function toMath(raw) {
 function mathOrRaw(text, isMath) {
   const value = String(text == null ? '' : text);
   if (!value) return '';
-  if (!value.includes('$')) {
+  const dollars = countDollars(value);
+  // A lone `$` (cost $5) is a dollar sign: escaped as a TeX special below.
+  if (dollars === 0 || dollars % 2 === 1) {
     if (isMath !== false) return toMath(value);
-    return value.includes('\\') ? PS.texOperators(value, false).replace(/[ \t]{2,}/g, ' ') : value;
+    return value.includes('\\') ? PS.texOperators(value, false).replace(/[ \t]{2,}/g, ' ') : escapeProse(value);
   }
   return value
     .replace(/\$([^$]+)\$/g, (all, inner) =>
-      `$${normalizeExpr(inner)}$`)
+      `$${inner.includes('\\') ? normalizeExpr(inner) : plainMath(inner)}$`)
     .replace(/[ \t]{2,}/g, ' ');
 }
 
@@ -805,10 +1044,20 @@ function forAllHead(init) {
   return toMath(init);
 }
 
-function emitNodes(nodes, depth, out) {
+/**
+ * `standard` writes what stock algpseudocode compiles (for LaTeX export):
+ * \ElsIf, `\State \Return`, bold to / print / break …; the stored dialect is
+ * shorter and is what the renderer reads.
+ */
+function emitNodes(nodes, depth, out, standard = false, used = new Set()) {
   const pad = '  '.repeat(depth);
-  const line = (text, comment) => out.push(`${pad}${text}${commentSuffix(comment)}`);
-  const body = (list) => emitNodes(list, depth + 1, out);
+  const line = (text, comment, holder, prefix = '') => {
+    const label = holder && holder[metaKey(prefix, 'label')];
+    const mark = holder && holder[metaKey(prefix, 'mark')];
+    out.push(`${pad}${text}${label ? ` \\label{${label}}` : ''}${commentSuffix(comment)}${mark ? ' % highlight' : ''}`);
+  };
+  const body = (list) => emitNodes(list, depth + 1, out, standard, used);
+  const keyword = (word) => (standard ? `\\State \\textbf{${word}}` : `\\${word[0].toUpperCase()}${word.slice(1)}`);
 
   for (const node of nodes) {
     switch (node.type) {
@@ -816,84 +1065,176 @@ function emitNodes(nodes, depth, out) {
       {
         // A comment-only line is `\State \Comment{...}`; `\text{}` only keeps an empty one alive.
         const text = field(node, 'text');
-        line(text ? `\\State ${text}` : node.comment ? '\\State' : '\\State \\text{}', node.comment);
+        line(text ? `\\State ${text}` : node.comment ? '\\State' : '\\State \\text{}', node.comment, node);
       }
         break;
       case 'call':
-        line(`\\State \\Call{${node.name || ''}}{${field(node, 'args')}}`, node.comment);
+        line(`\\State \\Call{${node.name || ''}}{${field(node, 'args')}}`, node.comment, node);
         break;
       case 'require':
       case 'ensure':
-        line(`\\${node.type === 'require' ? 'Require' : 'Ensure'} ${field(node, 'text')}`, node.comment);
+        line(`\\${node.type === 'require' ? 'Require' : 'Ensure'} ${field(node, 'text')}`, node.comment, node);
         break;
       case 'return':
-        line(`\\Return${node.text ? ` ${field(node, 'text')}` : ''}`, node.comment);
+        line(`${standard ? '\\State ' : ''}\\Return${node.text ? ` ${field(node, 'text')}` : ''}`, node.comment, node);
         break;
       case 'print':
-        line(`\\Print ${field(node, 'text')}`, node.comment);
+        line(`${keyword('print')} ${field(node, 'text')}`, node.comment, node);
         break;
       case 'break':
-        line('\\Break', node.comment);
-        break;
       case 'continue':
-        line('\\Continue', node.comment);
+        line(keyword(node.type), node.comment, node);
         break;
       case 'comment':
-        line(`\\Comment{${node.text || ''}}`);
+        line(`\\Comment{${node.text || ''}}`, null, node);
         break;
+      case 'statex': {
+        const text = field(node, 'text');
+        line(text ? `\\Statex ${text}` : '\\Statex', node.comment, node);
+        break;
+      }
+      case 'counter': {
+        const value = Math.max(0, (parseInt(node.value, 10) || 1) - 1);
+        line(standard ? `\\makeatletter\\setcounter{ALG@line}{${value}}\\makeatother` : `\\setcounter{ALG@line}{${value}}`, null, node);
+        break;
+      }
       case 'if':
         node.branches.forEach((branch, index) => {
-          line(`${index === 0 ? '\\If' : '\\Elif'}{${condition(branch, 'cond')}}`, index === 0 ? node.comment : branch.comment);
+          const head = index === 0 ? '\\If' : standard ? '\\ElsIf' : '\\Elif';
+          line(`${head}{${condition(branch, 'cond')}}`, index === 0 ? node.comment : branch.comment, index === 0 ? node : branch);
           body(branch.body);
         });
         if (node.elseBody) {
-          line('\\Else', node.elseComment);
+          line('\\Else', node.elseComment, node, 'else');
           body(node.elseBody);
         }
         line('\\EndIf');
         break;
       case 'while':
-        line(`\\While{${condition(node, 'cond')}}`, node.comment);
+        line(`\\While{${condition(node, 'cond')}}`, node.comment, node);
         body(node.body);
         line('\\EndWhile');
         break;
       case 'for': {
+        const to = node.downto ? (standard ? '\\textbf{downto}' : '\\DownTo') : (standard ? '\\textbf{to}' : '\\To');
         const head = node.all
           ? forAllHead(node.init || '')
           : node.bound
-            ? `${field(node, 'init')} ${node.downto ? '\\DownTo' : '\\To'} ${field(node, 'bound')}`
+            ? `${field(node, 'init')} ${to} ${field(node, 'bound')}`
             : field(node, 'init');
-        line(`\\${node.all ? 'ForAll' : 'For'}{${head}}`, node.comment);
+        const command = node.all ? 'ForAll' : node.parallel ? 'ParFor' : 'For';
+        if (node.parallel && !node.all) used.add('ParFor');
+        line(`\\${command}{${head}}`, node.comment, node);
         body(node.body);
-        line('\\EndFor');
+        line(standard && command === 'ParFor' ? '\\EndParFor' : '\\EndFor');
         break;
       }
       case 'repeat':
-        line('\\Repeat', node.comment);
+        line('\\Repeat', node.comment, node);
         body(node.body);
-        line(`\\Until{${condition(node, 'until')}}`, node.untilComment);
+        line(`\\Until{${condition(node, 'until')}}`, node.untilComment, node, 'until');
+        break;
+      case 'loop':
+        line('\\Loop', node.comment, node);
+        body(node.body);
+        line('\\EndLoop');
+        break;
+      case 'switch':
+        used.add('Switch');
+        line(`\\Switch{${field(node, 'cond')}}`, node.comment, node);
+        body(node.body);
+        line('\\EndSwitch');
+        break;
+      case 'case':
+        used.add('Switch');
+        line(node.default ? '\\Default' : `\\Case{${field(node, 'value')}}`, node.comment, node);
+        body(node.body);
+        line(standard && node.default ? '\\EndDefault' : '\\EndCase');
         break;
       case 'function': {
         const kind = node.kind === 'Procedure' ? 'Procedure' : 'Function';
-        line(`\\${kind}{${node.name || ''}}{${field(node, 'args')}}`, node.comment);
+        line(`\\${kind}{${node.name || ''}}{${field(node, 'args')}}`, node.comment, node);
         body(node.body);
         line(`\\End${kind}`);
         break;
       }
       default:
-        line(node.text || '', node.comment);
+        line(node.text || '', node.comment, node);
     }
   }
+  return used;
+}
+
+/** Block options: `\begin{algorithmic}[0]` hides line numbers, `[1]` shows them. */
+function algorithmicBegin(model, standard) {
+  if (model.numbers === false) return standard ? '\\begin{algorithmic}' : '\\begin{algorithmic}[0]';
+  return model.numbers === true || standard ? '\\begin{algorithmic}[1]' : '\\begin{algorithmic}';
+}
+
+function startCounter(model, standard) {
+  const start = parseInt(model.start, 10);
+  if (!(start > 1)) return null;
+  return standard ? `  \\makeatletter\\setcounter{ALG@line}{${start - 1}}\\makeatother` : `  \\setcounter{ALG@line}{${start - 1}}`;
 }
 
 PS.serializeLatex = function serializeLatex(model) {
   const out = ['\\begin{algorithm}'];
   if (model.caption) out.push(`\\caption{${model.caption}}`);
-  out.push('\\begin{algorithmic}');
+  out.push(algorithmicBegin(model, false));
+  const counter = startCounter(model, false);
+  if (counter) out.push(counter);
   emitNodes(model.nodes, 1, out);
   out.push('\\end{algorithmic}');
   out.push('\\end{algorithm}');
   return out.join('\n');
+};
+
+// Unicode a builder field may hold → TeX that pdfLaTeX accepts in text and math.
+const UNICODE_TEX = {
+  '≤': '\\le', '≥': '\\ge', '≠': '\\ne', '∞': '\\infty', '∈': '\\in', '∉': '\\notin', '∪': '\\cup', '∩': '\\cap',
+  '⊆': '\\subseteq', '⊂': '\\subset', '⊇': '\\supseteq', '⊃': '\\supset', '∅': '\\emptyset', '×': '\\times', '·': '\\cdot',
+  '←': '\\gets', '→': '\\to', '↑': '\\uparrow', '↓': '\\downarrow', '⌊': '\\lfloor', '⌋': '\\rfloor', '⌈': '\\lceil', '⌉': '\\rceil',
+  '∧': '\\land', '∨': '\\lor', '¬': '\\neg', '±': '\\pm', '…': '\\ldots', 'Θ': '\\Theta', 'Ω': '\\Omega', 'α': '\\alpha',
+  'β': '\\beta', 'γ': '\\gamma', 'δ': '\\delta', 'ε': '\\epsilon', 'θ': '\\theta', 'λ': '\\lambda', 'μ': '\\mu', 'π': '\\pi',
+  'σ': '\\sigma', 'φ': '\\phi', 'ω': '\\omega', 'Δ': '\\Delta', 'Σ': '\\Sigma', '−': '-', '′': "'",
+};
+
+const EXPORT_DEFINITIONS = {
+  ParFor: '\\algdef{SE}[PARFOR]{ParFor}{EndParFor}[1]{\\textbf{parallel for} #1}{\\algorithmicend\\ \\textbf{parallel for}}',
+  Switch: [
+    '\\algdef{SE}[SWITCH]{Switch}{EndSwitch}[1]{\\textbf{switch} #1}{\\algorithmicend\\ \\textbf{switch}}',
+    '\\algdef{SE}[CASE]{Case}{EndCase}[1]{\\textbf{case} #1:}{\\algorithmicend\\ \\textbf{case}}',
+    '\\algdef{SE}[DEFAULT]{Default}{EndDefault}{\\textbf{default}:}{\\algorithmicend\\ \\textbf{default}}',
+  ].join('\n%   '),
+};
+
+/**
+ * The block as LaTeX for a paper or homework: stock algorithm + algpseudocode
+ * commands, with the preamble it needs listed in a comment on top.
+ */
+PS.exportLatex = function exportLatex(model) {
+  const out = ['\\begin{algorithm}'];
+  if (model.caption) out.push(`\\caption{${model.caption}}`);
+  out.push(algorithmicBegin(model, true));
+  const counter = startCounter(model, true);
+  if (counter) out.push(counter);
+  const used = emitNodes(model.nodes, 1, out, true);
+  out.push('\\end{algorithmic}');
+  out.push('\\end{algorithm}');
+  const body = out.join('\n')
+    .replace(/\\twodots\b\s*/g, '\\mathinner{\\ldotp\\ldotp}')
+    .replace(/[≤≥≠∞∈∉∪∩⊆⊂⊇⊃∅×·←→↑↓⌊⌋⌈⌉∧∨¬±…ΘΩαβγδεθλμπσφωΔΣ−′]/g, (ch) => (
+      ch === '−' || ch === '′' ? UNICODE_TEX[ch] : `\\ensuremath{${UNICODE_TEX[ch]}}`))
+    .replace(/“([^”]*)”/g, '``$1\'\'');
+  const preamble = [
+    '% Preamble:',
+    '%   \\usepackage{amsmath}',
+    '%   \\usepackage{algorithm}',
+    '%   \\usepackage[noend]{algpseudocode}  % CLRS style; drop [noend] for "end if" lines',
+    '%   \\algrenewcommand\\algorithmiccomment[1]{\\hfill// #1}',
+    ...[...used].map((name) => `%   ${EXPORT_DEFINITIONS[name]}`),
+  ];
+  return `${preamble.join('\n')}\n${body}`;
 };
 
 /* ------------------------------------------------------------------ */
@@ -917,8 +1258,11 @@ const UNICODE_OPERATORS = [[/≠/g, '!='], [/≤/g, '<='], [/≥/g, '>='], [/−
 function cleanCondition(raw) {
   let value = String(raw || '').trim()
     .replace(/\s*\{\s*$/, '')
-    .replace(/\s*:\s*$/, '')
+    .replace(/\s*[:：]\s*$/, '')
+    .replace(/\s+begin\s*$/i, '')
     .replace(/\s+(?:then|do)\s*$/i, '')
+    // 如果 x > 0 则 / 当 i > 0 时执行
+    .replace(/\s*(?:则|那么|时执行|时做|的时候|时|执行|做)\s*[，,]?\s*$/, '')
     .trim();
   // One pair of parentheses around the whole condition (C style).
   if (/^\(.*\)$/.test(value)) {
@@ -934,27 +1278,134 @@ function cleanCondition(raw) {
 }
 PS.cleanCondition = cleanCondition;
 
+/** Split at top-level commas (not inside brackets). */
+function splitTopLevel(text, separator = ',') {
+  const parts = [];
+  let depth = 0;
+  let last = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if ('([{'.includes(ch)) depth++;
+    else if (')]}'.includes(ch)) depth--;
+    else if (ch === separator && depth === 0) {
+      parts.push(text.slice(last, i));
+      last = i + 1;
+    }
+  }
+  parts.push(text.slice(last));
+  return parts.map((part) => part.trim());
+}
+
+/** `n` → `n - 1`, `5` → `4`, `n + 1` → `n`: an exclusive end made inclusive (and back). */
+function shiftBound(value, step) {
+  const text = String(value).trim();
+  if (/^-?\d+$/.test(text)) return String(Number(text) + step);
+  const undo = step < 0 ? /^(.*\S)\s*\+\s*1$/ : /^(.*\S)\s*-\s*1$/;
+  const match = text.match(undo);
+  if (match) return match[1];
+  const wrapped = /[+\-*/\s]/.test(text) && !/^\(.*\)$/.test(text) && !/^[A-Za-z][\w.]*\(.*\)$/.test(text) ? `(${text})` : text;
+  return `${wrapped} ${step < 0 ? '-' : '+'} 1`;
+}
+
+/** C's `int i = 0; i < n; i++` → `i = 0` to `n - 1` (unit steps only). */
+function cForHead(head) {
+  const match = head.match(/^(?:[A-Za-z_][\w<>[\]:]*\s+)?([A-Za-z_]\w*)\s*=\s*([^;]+);\s*([A-Za-z_]\w*)\s*(<=|<|>=|>|!=)\s*([^;]+);\s*(.+)$/);
+  if (!match || match[3] !== match[1]) return null;
+  const [, name, start, , op, end, stepText] = match;
+  const step = stepText.replace(/\s+/g, '');
+  const up = [`${name}++`, `++${name}`, `${name}+=1`, `${name}=${name}+1`].includes(step);
+  const down = [`${name}--`, `--${name}`, `${name}-=1`, `${name}=${name}-1`].includes(step);
+  let bound = null;
+  if (up && (op === '<' || op === '!=')) bound = shiftBound(end, -1);
+  else if (up && op === '<=') bound = end.trim();
+  else if (down && op === '>') bound = shiftBound(end, 1);
+  else if (down && op === '>=') bound = end.trim();
+  if (bound == null) return null;
+  return { kind: 'for', fields: { init: `${name} = ${start.trim()}`, bound, downto: down, split: true } };
+}
+
+/** Python's `i in range(a, b)` → `i = a` to `b - 1` (steps of ±1 only). */
+function rangeHead(head) {
+  const match = head.match(/^([A-Za-z_]\w*)\s+in\s+range\((.*)\)$/);
+  if (!match) return null;
+  const args = splitTopLevel(match[2]).filter(Boolean);
+  const name = match[1];
+  if (args.length === 1) return { kind: 'for', fields: { init: `${name} = 0`, bound: shiftBound(args[0], -1), downto: false, split: true } };
+  const step = args.length === 3 ? args[2].replace(/\s+/g, '') : '1';
+  if (step === '1' || step === '+1') {
+    return { kind: 'for', fields: { init: `${name} = ${args[0]}`, bound: shiftBound(args[1], -1), downto: false, split: true } };
+  }
+  if (step === '-1') {
+    return { kind: 'for', fields: { init: `${name} = ${args[0]}`, bound: shiftBound(args[1], 1), downto: true, split: true } };
+  }
+  return null;
+}
+
 /** `i = 1 to n` → init / bound / downto; `v in S` (or ∈) → a for-each head. */
 function splitForHead(rest) {
   const head = cleanCondition(rest);
-  const each = head.match(/^(?:each|all)\s+(.*)$/i);
+  const c = head.includes(';') ? cForHead(head) : null;
+  if (c) return c;
+  const each = head.match(/^(?:each|all|每个|每一个)\s*(.*)$/i);
   if (each) return { kind: 'forall', fields: { init: each[1].replace(/\s*∈\s*/, ' in ') } };
-  if (/^[^\s=]+\s+(?:in|∈)\s/.test(head)) return { kind: 'forall', fields: { init: head.replace(/\s*∈\s*/, ' in ') } };
-  const range = head.match(/^(.*?)\s+(to|downto|down\s+to)(?:\s+(.*))?$/i);
-  if (range) return { kind: 'for', fields: { init: range[1], bound: range[3] || '', downto: !/^to$/i.test(range[2]), split: true } };
+  const range = rangeHead(head);
+  if (range) return range;
+  if (/^[^\s=]+\s+(?:in|∈)\s/.test(head) || /^[^\s=]+\s*∈\s*\S/.test(head)) {
+    return { kind: 'forall', fields: { init: head.replace(/\s*∈\s*/, ' in ') } };
+  }
+  // 对于 i 从 1 到 n / 对于 i = 1 到 n / 对于 i = n 递减到 1
+  const from = head.match(/^(\S+?)\s*从\s*(.+?)\s*(递减到|降到|到)\s*(.*)$/);
+  if (from) return { kind: 'for', fields: { init: `${from[1]} = ${from[2]}`, bound: from[4], downto: from[3] !== '到', split: true } };
+  const cjk = head.match(/^(.*?\S)\s*(递减到|降到|到)\s*(.*)$/);
+  if (cjk && /[一-鿿]/.test(cjk[2])) return { kind: 'for', fields: { init: cjk[1], bound: cjk[3], downto: cjk[2] !== '到', split: true } };
+  const to = head.match(/^(.*?)\s+(to|downto|down\s+to)(?:\s+(.*))?$/i);
+  if (to) return { kind: 'for', fields: { init: to[1], bound: to[3] || '', downto: !/^to$/i.test(to[2]), split: true } };
   return { kind: 'for', fields: { init: head, bound: '', downto: false } };
 }
 PS.splitForHead = splitForHead;
 
-/** `Max-Heapify(A, i)` → name and args; a bare name keeps empty args. */
+// A typed C / Java parameter (`int x`, `int[] A`, `const vector<int>& v`) → its name.
+const TYPED_PARAM = /^(?:(?:const|final|unsigned|signed)\s+)*[A-Za-z_][\w:<>,[\]]*(?:\s*[*&]+\s*|\s+)([A-Za-z_]\w*)\s*(?:\[\s*\])*$/;
+
+/** Parameters as CLRS writes them: names only (Python annotations, C types and defaults dropped). */
+function cleanParams(text) {
+  return splitTopLevel(text).map((param) => {
+    let value = param;
+    const colon = splitTopLevel(value, ':');
+    if (colon.length > 1 && /^[A-Za-z_]\w*$/.test(colon[0])) value = colon[0]; // A: list[int]
+    value = value.replace(/^([A-Za-z_]\w*)\s*=\s*.+$/, '$1'); // lo=0
+    const typed = value.match(TYPED_PARAM);
+    return typed ? typed[1] : value;
+  }).filter((param, index, all) => param || all.length > 1).join(', ');
+}
+
+/** `Max-Heapify(A, i)` → name and args; a return type after `)` is dropped; a bare name keeps empty args. */
 function splitSignature(rest) {
   const value = String(rest || '').trim().replace(/\s*[:{]\s*$/, '');
-  const match = value.match(/^([^(]*)\((.*?)\)?$/);
-  return match ? { name: match[1].trim(), args: match[2].trim() } : { name: value, args: '' };
+  const open = value.indexOf('(');
+  if (open < 0) return { name: value.replace(/\s*(?:->|\breturns?\b).*$/i, '').trim(), args: '' };
+  let depth = 0;
+  let close = -1;
+  for (let i = open; i < value.length && close < 0; i++) {
+    if (value[i] === '(') depth++;
+    else if (value[i] === ')' && --depth === 0) close = i;
+  }
+  const inside = close < 0 ? value.slice(open + 1) : value.slice(open + 1, close);
+  return { name: value.slice(0, open).trim(), args: close < 0 ? inside.trim() : cleanParams(inside) };
 }
 PS.splitSignature = splitSignature;
 
-const END_LINE = /^(?:end(?:\s*(?:if|while|for|foreach|procedure|function|algorithm|repeat|loop))?|endif|endwhile|endfor|fi|od|done|\})\s*;?$/i;
+const END_LINE = /^(?:end(?:\s*(?:if|while|for|foreach|procedure|function|algorithm|repeat|loop|switch|case))?\.?|endif|endwhile|endfor|endloop|fi|od|done|esac|\}|结束(?:如果|循环|过程|函数|算法)?)\s*;?$/i;
+
+// C / Java function headers, recognized in pasted code: `int max(int a, int b) {`.
+const C_FUNCTION = /^(?:(?:public|private|protected|static|inline|final|virtual|extern|unsigned|signed|const)\s+)*(?:void|int|long|short|bool|boolean|double|float|char|string|String|auto|size_t|[A-Z]\w*(?:<[^>]*>)?(?:\[\])?|(?:std::)?vector<[^>]*>)\s*[*&]*\s+([A-Za-z_]\w*)\s*\((.*)\)\s*(?:const\s*)?\{?\s*$/;
+
+/** `case 1: y = 2` → the value and the statement after it. */
+function splitCase(rest, final) {
+  const parts = final ? splitTopLevel(rest, ':') : [rest];
+  if (parts.length < 2) return { value: final ? cleanCondition(rest) : rest, rest: '' };
+  return { value: parts[0].trim(), rest: parts.slice(1).join(':').trim() };
+}
 
 PS.typedLine = function typedLine(raw, options = {}) {
   const final = !!options.final;
@@ -969,7 +1420,7 @@ PS.typedLine = function typedLine(raw, options = {}) {
   if (final && END_LINE.test(value)) return make('end', {}, '');
 
   // `} else {`, `} else if (x) {`: a closing brace in front of else is noise.
-  const body = value.replace(/^\}\s*(?=else\b)/i, '');
+  const body = value.replace(/^\}\s*(?=else\b|否则)/i, '');
   const shift = lead + value.length - body.length;
   const keyword = (pattern) => body.match(pattern);
   const restAt = (match, group) => {
@@ -977,22 +1428,28 @@ PS.typedLine = function typedLine(raw, options = {}) {
     return rest == null ? null : rest;
   };
 
-  if ((m = keyword(/^(?:else\s*if|elseif|elif|elsif)(?:\s+([\s\S]*))?$/i))) {
+  if ((m = keyword(/^(?:else\s*if|elseif|elif|elsif)(?:\s+([\s\S]*))?$/i)) || (m = keyword(/^否则\s*(?:如果|若)\s*([\s\S]+)$/))) {
     const rest = restAt(m, 1);
     if (rest == null && !final) return null;
     return { kind: 'elseif', fields: { cond: final ? cleanCondition(rest || '') : (rest || '') }, cut: shift + body.length - (rest || '').length };
   }
-  if ((m = keyword(/^else\s*:?\s*\{?(?:\s+([\s\S]*))?$/i)) || (final && (m = keyword(/^else\s*[:{]?\s*$/i)))) {
+  if ((m = keyword(/^else\s*:?\s*\{?(?:\s+([\s\S]*))?$/i)) || (final && (m = keyword(/^else\s*[:{]?\s*$/i)))
+    || (m = keyword(/^否则\s*[:：,，]?\s*([\s\S]*)$/))) {
     const rest = restAt(m, 1) || '';
-    // While typing, `else`, `else i` and `else if` may still become `else if`.
-    if (!final && (rest === '' || /^(?:i|if)$/i.test(rest))) return null;
+    // While typing, `else`, `else i` and `else if` may still become `else if` (否则 → 否则如果).
+    if (!final && (rest === '' || /^(?:i|if|如|如果|若)$/i.test(rest))) return null;
     return { kind: 'else', fields: { rest: final ? rest.trim() : rest }, cut: shift + body.length - rest.length };
   }
 
   const simple = [
     ['if', /^if(?:\s+([\s\S]*))?$/i],
+    ['if', /^(?:如果|若|假如)\s*([\s\S]+)$/],
     ['while', /^while(?:\s+([\s\S]*))?$/i],
+    ['while', /^当\s+([\s\S]*)$/],
+    ['while', /^当([\s\S]+?时(?:执行|做)?\s*[:：]?)$/],
     ['until', /^until(?:\s+([\s\S]*))?$/i],
+    ['until', /^直到\s*([\s\S]+)$/],
+    ['switch', /^(?:switch|match)(?:\s+([\s\S]*))?$/i],
   ];
   for (const [kind, pattern] of simple) {
     if ((m = value.match(pattern))) {
@@ -1002,47 +1459,71 @@ PS.typedLine = function typedLine(raw, options = {}) {
     }
   }
 
-  if ((m = value.match(/^(?:for\s*each|foreach|for\s+all)(?:\s+([\s\S]*))?$/i))) {
+  if ((m = value.match(/^case(?:\s+([\s\S]*))?$/i))) {
+    const rest = restAt(m, 1);
+    if (rest == null && !final) return null;
+    // Python's `case _:` is the default case.
+    if (/^_\s*:?\s*$/.test(rest || '')) return make('default', { rest: '' }, '');
+    return make('case', splitCase(rest || '', final), rest);
+  }
+  if ((m = value.match(/^(?:default|otherwise|其他情况|其它情况)(\s*[:：])?\s*([\s\S]*)$/i))) {
+    if (!m[1] && !final) return null;
+    if (!m[1] && m[2]) return null; // `defaults = …` is a statement
+    return make('default', { rest: final ? m[2].trim() : m[2] }, m[2]);
+  }
+
+  if ((m = value.match(/^(?:for\s*each|foreach|for\s+all)(?:\s+([\s\S]*))?$/i)) || (m = value.match(/^对于?\s*每一?个\s*([\s\S]+)$/))) {
     const rest = restAt(m, 1);
     if (rest == null && !final) return null;
     return make('forall', { init: cleanCondition(rest || '').replace(/\s*∈\s*/, ' in ') }, rest);
   }
-  if ((m = value.match(/^for(?:\s+([\s\S]*))?$/i))) {
-    const rest = restAt(m, 1);
+  if ((m = value.match(/^(parallel\s+)?for(?:\s+([\s\S]*))?$/i)) || (m = value.match(/^(并行\s*)?对于\s*([\s\S]+)$/))) {
+    const parallel = !!m[1];
+    const rest = restAt(m, 2);
     if (rest == null && !final) return null;
     const head = splitForHead(rest || '');
     // While typing, `for i = 1 t` is not split yet (it may become `total`): only a whole
     // ` to ` / ` downto ` followed by a space splits the head.
-    if (!final && head.kind === 'for' && !/\s(?:to|downto)\s/i.test(rest || '')) {
-      return make('for', { init: rest || '', bound: '', downto: false }, rest);
+    if (!final && head.kind === 'for' && !/\s(?:to|downto)\s|到/i.test(rest || '')) {
+      return make('for', { init: rest || '', bound: '', downto: false, parallel }, rest);
     }
+    if (parallel && head.kind === 'for') head.fields.parallel = true;
     return make(head.kind, head.fields, rest);
   }
 
-  if ((m = value.match(/^repeat(?:\s*[:{])?(?:(\s+)([\s\S]*))?$/i))) {
-    if (m[1] == null && !final) return null;
-    const rest = m[2] || '';
-    return make('repeat', { rest: final ? rest.trim() : rest }, rest);
+  if ((m = value.match(/^(repeat|loop)(?:\s*[:{])?(?:(\s+)([\s\S]*))?$/i)) || (m = value.match(/^(重复|循环)\s*[:：]?(?:(\s+)([\s\S]*))?$/))) {
+    if (m[2] == null && !final) return null;
+    const rest = m[3] || '';
+    return make(/^(loop|循环)$/i.test(m[1]) ? 'loop' : 'repeat', { rest: final ? rest.trim() : rest }, rest);
   }
-  if ((m = value.match(/^(return|print)(?:\s+([\s\S]*))?$/i))) {
+  // C's `do {` (closed by `} while (…);`): a repeat loop. Only for a finished line.
+  if (final && /^do\s*[:{]?$/i.test(value)) return make('repeat', { rest: '', doWhile: true }, '');
+
+  if ((m = value.match(/^(return|print)(?:\s+([\s\S]*))?$/i)) || (m = value.match(/^(返回|打印|输出)(?![:：])\s*([\s\S]+)$/))) {
     const rest = restAt(m, 2);
+    const kind = /^(return|返回)$/i.test(m[1]) ? 'return' : 'print';
     if (rest == null && !final) return null;
-    if (m[1].toLowerCase() === 'print' && rest == null) return null;
-    return make(m[1].toLowerCase(), { text: final ? (rest || '').trim().replace(/;$/, '') : (rest || '') }, rest);
+    if (kind === 'print' && rest == null) return null;
+    return make(kind, { text: final ? (rest || '').trim().replace(/;$/, '') : (rest || '') }, rest);
   }
+  if (final && /^返回\s*$/.test(value)) return make('return', { text: '' }, '');
   if ((m = value.match(/^(break|continue)(\s*;?\s*)$/i))) {
     if (!final && !m[2]) return null;
     return make(m[1].toLowerCase(), {}, '');
   }
-  if ((m = value.match(/^(procedure|function|algorithm|def)(?:\s+([\s\S]*))?$/i))) {
+  if (final && (m = value.match(/^(跳出(?:循环)?|中断|继续)\s*$/))) return make(m[1] === '继续' ? 'continue' : 'break', {}, '');
+  if ((m = value.match(/^(procedure|function|algorithm|def)(?:\s+([\s\S]*))?$/i)) || (m = value.match(/^(过程|函数|算法)\s*([A-Za-z][\s\S]*)$/))) {
     const rest = restAt(m, 2);
     if (rest == null && !final) return null;
-    const kind = /^function$/i.test(m[1]) ? 'Function' : 'Procedure';
+    const kind = /^(function|函数)$/i.test(m[1]) ? 'Function' : 'Procedure';
     return make('function', Object.assign({ kind }, splitSignature(rest || '')), rest);
   }
-  if ((m = value.match(/^(require|ensure|input|output)s?(?:\s*:\s*|\s+)([\s\S]*)$/i))) {
-    const kind = /^(require|input)/i.test(m[1]) ? 'require' : 'ensure';
+  if ((m = value.match(/^(require|ensure|input|output)s?(?:\s*:\s*|\s+)([\s\S]*)$/i)) || (m = value.match(/^(输入|输出)\s*[:：]\s*([\s\S]*)$/))) {
+    const kind = /^(require|input|输入)/i.test(m[1]) ? 'require' : 'ensure';
     return make(kind, { text: m[2] }, m[2]);
+  }
+  if (final && (m = value.match(C_FUNCTION))) {
+    return make('function', { kind: 'Function', name: m[1], args: cleanParams(m[2]) }, '');
   }
   return null;
 };
@@ -1054,9 +1535,17 @@ PS.nodeFromTyped = function nodeFromTyped(typed) {
   switch (typed.kind) {
     case 'if': return PS.node('if', { branches: [Object.assign({ body: [] }, math('cond', f.cond))], elseBody: null });
     case 'while': return PS.node('while', Object.assign({ body: [] }, math('cond', f.cond)));
-    case 'for': return PS.node('for', Object.assign({ downto: !!f.downto, body: [] }, math('init', f.init), math('bound', f.bound)));
+    case 'for': {
+      const node = PS.node('for', Object.assign({ downto: !!f.downto, body: [] }, math('init', f.init), math('bound', f.bound)));
+      if (f.parallel) node.parallel = true;
+      return node;
+    }
     case 'forall': return PS.node('for', Object.assign({ all: true, bound: '', downto: false, body: [] }, math('init', f.init)));
     case 'repeat': return PS.node('repeat', { body: [], until: '' });
+    case 'loop': return PS.node('loop', { body: [] });
+    case 'switch': return PS.node('switch', Object.assign({ body: [] }, math('cond', f.cond)));
+    case 'case': return PS.node('case', Object.assign({ body: [] }, math('value', f.value)));
+    case 'default': return PS.node('case', { default: true, value: '', body: [] });
     case 'return':
     case 'print':
     case 'require':
@@ -1073,6 +1562,13 @@ PS.nodeFromTyped = function nodeFromTyped(typed) {
 /** A plain statement node. */
 PS.statementNode = (text) => PS.node('state', { text: PS.normalizeOperators(text || ''), textMath: !hasCjkText(text) });
 
+/** A finished line of text → its node: `return x` a return, `break` a break, else a statement. */
+PS.lineNode = function lineNode(text) {
+  const typed = PS.typedLine(text, { final: true });
+  const simple = typed && ['return', 'print', 'break', 'continue'].includes(typed.kind) ? PS.nodeFromTyped(typed) : null;
+  return simple || PS.statementNode(String(text || '').trim().replace(/;$/, ''));
+};
+
 /* ---- pasted plain text → nodes ---- */
 
 const CALL_SHAPED = /^([A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*)\s*\((.*)\)\s*:?\s*$/;
@@ -1083,20 +1579,124 @@ const titleName = (name) => name.split('-').map((part) => (
   /^[A-Z][A-Z0-9]+$/.test(part) && !ACRONYMS.has(part) && /[A-Z]{2}/.test(part) ? part[0] + part.slice(1).toLowerCase() : part
 )).join('-');
 
-/** `x = y // note` → text and comment (also ▷ and ` # `), outside quotes. */
-function splitTrailingComment(line) {
+/** `x = y // note` → text and comment (also ▷ and ` # `), outside quotes. Python's `//` is division. */
+function splitTrailingComment(line, python = false) {
   let quote = null;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
     if (quote) { if (ch === quote || (quote === '“' && ch === '”')) quote = null; continue; }
     if (ch === '"' || ch === '“') { quote = ch; continue; }
     const rest = line.slice(i);
-    if (i > 0 && /\s/.test(line[i - 1]) && /^(?:\/\/|▷|#(?=\s))/.test(rest)) {
+    const marker = python ? /^(?:▷|#(?=\s))/ : /^(?:\/\/|▷|#(?=\s))/;
+    if (i > 0 && /\s/.test(line[i - 1]) && marker.test(rest)) {
       return { text: line.slice(0, i).trimEnd(), comment: rest.replace(/^(?:\/\/|▷|#)\s?/, '') };
     }
   }
   return { text: line, comment: null };
 }
+
+/** `x > 0` → `x <= 0`: the until of a do-while is its condition negated. */
+function invertCondition(cond) {
+  const value = String(cond || '').trim();
+  const parts = value.split(/\s*(<=|>=|==|!=|<|>)\s*/);
+  if (parts.length === 3 && !/\b(?:and|or|not)\b|&&|\|\|/.test(value)) {
+    const opposite = { '<': '>=', '<=': '>', '>': '<=', '>=': '<', '==': '!=', '!=': '==' }[parts[1]];
+    return `${parts[0]} ${opposite} ${parts[2]}`;
+  }
+  if (/^not\s+/.test(value) && !/\b(?:and|or)\b/.test(value)) return value.replace(/^not\s+/, '');
+  return `not (${value})`;
+}
+PS.invertCondition = invertCondition;
+
+/**
+ * A block head with its body on the same line: `if x > 0 then y = 1`,
+ * `if x: return y`, `if (x) y = 1;`, `while (i < n) { i++; }`.
+ * → { head, body } or null.
+ */
+function inlineBody(text) {
+  const keyword = text.match(/^(?:(if|while|for|elif|else\s+if|elsif|elseif)\b|(如果|当))\s*/i);
+  if (!keyword) return null;
+  const rest = text.slice(keyword[0].length);
+  const headOf = (cond) => `${keyword[1] || keyword[2]} ${cond.trim()}`;
+  // C: if (cond) statement
+  if (rest.startsWith('(')) {
+    let depth = 0;
+    let close = -1;
+    for (let i = 0; i < rest.length && close < 0; i++) {
+      if (rest[i] === '(') depth++;
+      else if (rest[i] === ')' && --depth === 0) close = i;
+    }
+    const after = close < 0 ? '' : rest.slice(close + 1).trim();
+    if (after && after !== '{' && !/^(?:then|do)$/i.test(after)) {
+      const inner = after.replace(/^\{\s*/, '').replace(/\s*\}$/, '');
+      return inner ? { head: headOf(rest.slice(0, close + 1)), body: inner } : null;
+    }
+    return null;
+  }
+  const word = rest.match(/^(.*?\S)\s+(?:then|do)\s+(\S.*)$/i) || rest.match(/^(.*?\S)\s*(?:则|时)\s*[，,]?\s*(\S.*)$/);
+  if (word && !/^begin$/i.test(word[2])) return { head: headOf(word[1]), body: word[2] };
+  const colon = splitTopLevel(rest, ':');
+  if (colon.length > 1 && colon[colon.length - 1] && !/^\s*=/.test(colon[colon.length - 1])) {
+    return { head: headOf(colon.slice(0, -1).join(':')), body: colon[colon.length - 1] };
+  }
+  const brace = rest.match(/^(.*?\S)\s*\{\s*(.+?)\s*\}$/);
+  if (brace) return { head: headOf(brace[1]), body: brace[2] };
+  return null;
+}
+
+// A C / Java / JavaScript declaration's type: `int s = 0` is the assignment `s = 0` in pseudocode.
+const DECLARATION = /^(?:(?:const|final|static|unsigned|signed|let|var)\s+)*(?:(?:int|long|short|bool|boolean|double|float|char|string|String|auto|size_t|var|let|const)(?:\[\])*\s+)?(?=[A-Za-z_]\w*(?:\[[^\]]*\])?\s*=[^=])/;
+
+/** Statements on one line: `a = 1; b = 2;` (C) → nodes. */
+function lineNodes(text, split) {
+  const parts = split ? splitTopLevel(text, ';').filter(Boolean) : [text];
+  return parts
+    .map((part) => (split ? part.replace(DECLARATION, '') : part))
+    .filter((part) => !/^pass$/.test(part.trim()))
+    .map((part) => PS.lineNode(part));
+}
+
+/** Python's floor division `(lo + hi) // 2` → `floor((lo + hi) / 2)`. */
+function floorDivision(text) {
+  let value = text;
+  for (let guard = 0; guard < 20; guard++) {
+    const at = value.search(/\s*\/\/\s*/);
+    if (at < 0) break;
+    const op = value.slice(at).match(/^\s*\/\/\s*/)[0];
+    // Left operand: a bracketed group (with the name before it) or a token.
+    let start = at;
+    if (value[at - 1] === ')' || value[at - 1] === ']') {
+      let depth = 0;
+      for (let i = at - 1; i >= 0; i--) {
+        if (')]'.includes(value[i])) depth++;
+        else if ('(['.includes(value[i]) && --depth === 0) { start = i; break; }
+      }
+      while (start > 0 && /[\w.]/.test(value[start - 1])) start--;
+    } else {
+      while (start > 0 && /[\w.]/.test(value[start - 1])) start--;
+    }
+    let end = at + op.length;
+    if (value[end] === '(') {
+      let depth = 0;
+      for (let i = end; i < value.length; i++) {
+        if (value[i] === '(') depth++;
+        else if (value[i] === ')' && --depth === 0) { end = i + 1; break; }
+      }
+    } else {
+      while (end < value.length && /[\w.]/.test(value[end])) end++;
+      while (value[end] === '[' || value[end] === '(') {
+        const close = value[end] === '[' ? ']' : ')';
+        const found = value.indexOf(close, end);
+        if (found < 0) break;
+        end = found + 1;
+      }
+    }
+    if (start === at || end === at + op.length) break;
+    value = `${value.slice(0, start)}floor(${value.slice(start, at)} / ${value.slice(at + op.length, end)})${value.slice(end)}`;
+  }
+  return value;
+}
+PS.floorDivision = floorDivision;
 
 /**
  * Plain pseudocode → nodes. Structure comes from indentation (Python, CLRS
@@ -1104,34 +1704,106 @@ function splitTrailingComment(line) {
  * `}`), from those. Line numbers (`1 for ...`, `2. x = 1`) are dropped.
  */
 PS.parsePlain = function parsePlain(source) {
-  const raw = String(source == null ? '' : source).replace(/\r\n?/g, '\n').split('\n')
-    .map((line) => line.replace(/\t/g, '    ').replace(/\s+$/, ''))
-    .filter((line) => line.trim());
+  const lines = String(source == null ? '' : source).replace(/\r\n?/g, '\n').split('\n')
+    .map((line) => line.replace(/\t/g, '    ').replace(/\s+$/, ''));
+  // Python docstrings become comment lines.
+  const raw = [];
+  let docstring = null;
+  for (const line of lines) {
+    const indent = line.match(/^\s*/)[0];
+    const body = line.trim();
+    if (docstring) {
+      const end = body.indexOf(docstring);
+      const text = (end < 0 ? body : body.slice(0, end)).trim();
+      if (text) raw.push(`${indent}// ${text}`);
+      if (end >= 0) docstring = null;
+      continue;
+    }
+    const open = body.match(/^(?:[rbu]?)("""|''')(.*)$/i);
+    if (open) {
+      const close = open[2].indexOf(open[1]);
+      const text = (close < 0 ? open[2] : open[2].slice(0, close)).trim();
+      if (text) raw.push(`${indent}// ${text}`);
+      if (close < 0) docstring = open[1];
+      continue;
+    }
+    if (!body) continue;
+    // `begin` (Pascal) or `{` (Allman style) on a line of its own opens the block of the line above.
+    if (/^(?:begin|\{)$/i.test(body)) {
+      if (raw.length) raw[raw.length - 1] += body === '{' ? ' {' : ' begin';
+      continue;
+    }
+    raw.push(line);
+  }
+  const all = raw.join('\n');
+  const python = /^\s*(?:def|elif|class)\b|:\s*(?:#.*)?$/m.test(all) && !/[{}]\s*$/m.test(all);
+  // Brace (and begin/end) languages: a head without `{` / begin owns one statement.
+  const braces = /[{}]/.test(all) || /\sbegin$/im.test(all);
+
   const numberedCount = raw.filter((line) => /^\s*\d+[.:)]?\s/.test(line)).length;
   const dropNumbers = numberedCount >= 2 && numberedCount >= raw.length / 2;
   const items = raw.map((line) => {
     const number = dropNumbers ? line.match(/^\s*\d+[.:)]?\s+/) : null;
     const start = number ? number[0].length : line.match(/^\s*/)[0].length;
     let text = applyAll(line.slice(start), UNICODE_OPERATORS);
-    const split = splitTrailingComment(text);
+    const split = splitTrailingComment(text, python);
     text = split.text.replace(/\s*;\s*$/, '');
+    if (python) text = floorDivision(text);
     // Procedure names copied in capitals: INSERTION-SORT(A) → Insertion-Sort(A).
     text = text.replace(/\b([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*)(?=\s*\()/g, (name) => ((name.match(/[A-Z]/g) || []).length >= 4 ? titleName(name) : name));
     return { indent: start, text, comment: split.comment, numbered: !!number };
   });
-  const explicit = items.some((item) => END_LINE.test(item.text.trim()) || /^\}\s*else\b/i.test(item.text.trim()));
+  const explicit = items.some((item) => END_LINE.test(item.text.trim()) || /^\}\s*(?:else|while)\b/i.test(item.text.trim()));
 
   const nodes = [];
-  // Open blocks: the list new lines go into, the node owning it, and its indent.
+  // Open blocks: the list new lines go into, the node owning it, its indent, and whether it
+  // closes by itself after one statement (`if (x)` without a brace).
   const stack = [{ list: nodes, owner: null, indent: -1 }];
   const top = () => stack[stack.length - 1];
   const lastIn = (list) => list[list.length - 1];
   const withComment = (node, comment) => { if (comment != null) node.comment = comment; return node; };
+  const opensBrace = (text) => /(?:\{|\bbegin)\s*$/i.test(text);
+  /** After a statement: blocks that own a single statement are done. */
+  const settle = () => {
+    while (stack.length > 1 && top().single && top().list.length) stack.pop();
+  };
+  const pushBlock = (frame, text) => {
+    stack.push(Object.assign(frame, { single: explicit && braces && !opensBrace(text) && !python }));
+  };
+  const addStatements = (list, text) => {
+    const added = lineNodes(text, braces);
+    list.push(...added);
+    return added;
+  };
 
   items.forEach((item, index) => {
-    const text = item.text.trim();
+    let text = item.text.trim();
     if (!explicit) while (stack.length > 1 && top().indent >= item.indent) stack.pop();
-    const typed = PS.typedLine(text, { final: true });
+
+    // `} while (x > 0);` closes a do … while.
+    const doWhile = explicit && text.match(/^\}\s*while\b\s*(.*)$/i);
+    if (doWhile && top().owner && top().owner.type === 'repeat') {
+      const repeat = top().owner;
+      const cond = invertCondition(cleanCondition(doWhile[1]));
+      Object.assign(repeat, { until: PS.normalizeOperators(cond), untilMath: !hasCjkText(cond) });
+      if (item.comment != null) repeat.untilComment = item.comment;
+      stack.pop();
+      settle();
+      return;
+    }
+    if (explicit && /^\}/.test(text) && !/^\}\s*(?:else|否则)/i.test(text)) {
+      // `}` closes the innermost braced block (a switch's open case goes with it).
+      while (stack.length > 1 && top().single) stack.pop();
+      if (top().owner && top().owner.type === 'case') stack.pop();
+      if (stack.length > 1) stack.pop();
+      settle();
+      text = text.replace(/^\}\s*;?/, '').trim();
+      if (!text) return;
+    }
+
+    const inline = inlineBody(text);
+    const headText = inline ? inline.head : text;
+    const typed = PS.typedLine(headText, { final: true });
     const next = items[index + 1];
 
     // Procedure header: keyword, or a call-shaped line that heads a body
@@ -1153,8 +1825,9 @@ PS.parsePlain = function parsePlain(source) {
 
     if (typed && (typed.kind === 'else' || typed.kind === 'elseif')) {
       let ifNode = null;
-      if (explicit) {
-        if (top().owner && top().owner.type === 'if') { ifNode = top().owner; stack.pop(); }
+      if (explicit && top().owner && top().owner.type === 'if' && !top().single) {
+        ifNode = top().owner;
+        stack.pop();
       } else if (lastIn(top().list) && lastIn(top().list).type === 'if') {
         ifNode = lastIn(top().list);
       }
@@ -1164,55 +1837,117 @@ PS.parsePlain = function parsePlain(source) {
           ifNode.elseBody = [];
           if (item.comment != null) ifNode.elseComment = item.comment;
           list = ifNode.elseBody;
-          if (typed.fields.rest) list.push(PS.statementNode(typed.fields.rest));
+          if (typed.fields.rest) {
+            addStatements(list, typed.fields.rest.replace(/^\{\s*/, '').replace(/\s*\}$/, ''));
+            // `else x = 1;` on one line owns nothing more in brace code.
+            if (explicit && braces && !opensBrace(text)) return;
+          }
         } else {
           const branch = { cond: PS.normalizeOperators(typed.fields.cond), condMath: !hasCjkText(typed.fields.cond), body: [] };
           if (item.comment != null) branch.comment = item.comment;
           ifNode.branches.push(branch);
           list = branch.body;
+          if (inline) {
+            addStatements(list, inline.body);
+            return;
+          }
         }
-        stack.push({ list, owner: ifNode, indent: item.indent });
+        pushBlock({ list, owner: ifNode, indent: item.indent }, text);
+        return;
+      }
+      // Python's `while … else:` / `for … else:` runs when the loop ends without break.
+      const loop = lastIn(top().list);
+      if (typed.kind === 'else' && loop && (loop.type === 'while' || loop.type === 'for')) {
+        top().list.push(PS.node('state', { text: '', textMath: true, comment: item.comment || 'if the loop above ended without break:' }));
+        if (typed.fields.rest) addStatements(top().list, typed.fields.rest);
+        stack.push({ list: top().list, owner: null, indent: item.indent });
         return;
       }
     }
     if (typed && typed.kind === 'until') {
-      const repeat = explicit ? top().owner : lastIn(top().list);
+      const repeat = explicit && top().owner && top().owner.type === 'repeat' ? top().owner : lastIn(top().list);
       if (repeat && repeat.type === 'repeat') {
         repeat.until = PS.normalizeOperators(typed.fields.cond);
         repeat.untilMath = !hasCjkText(typed.fields.cond);
         if (item.comment != null) repeat.untilComment = item.comment;
         if (explicit && top().owner === repeat) stack.pop();
+        settle();
+        return;
+      }
+    }
+    // A do … while without braces (`do` / body / `while (x > 0)` at the do's indent).
+    if (typed && typed.kind === 'while' && !explicit) {
+      const repeat = lastIn(top().list);
+      if (repeat && repeat.type === 'repeat' && repeat.doWhile && !repeat.until && !(next && next.indent > item.indent)) {
+        const cond = invertCondition(typed.fields.cond);
+        Object.assign(repeat, { until: PS.normalizeOperators(cond), untilMath: !hasCjkText(cond) });
         return;
       }
     }
     if (typed && typed.kind === 'end') {
-      if (explicit && stack.length > 1) stack.pop();
+      if (explicit && stack.length > 1) {
+        while (stack.length > 1 && top().single) stack.pop();
+        if (top().owner && top().owner.type === 'case') stack.pop();
+        if (stack.length > 1) stack.pop();
+        settle();
+      }
+      return;
+    }
+    if (typed && (typed.kind === 'case' || typed.kind === 'default')) {
+      // A case runs until the next case: it never owns a single statement.
+      while (stack.length > 1 && top().single) stack.pop();
+      if (top().owner && top().owner.type === 'case') stack.pop();
+      const node = withComment(PS.nodeFromTyped(typed), item.comment);
+      top().list.push(node);
+      const rest = typed.kind === 'case' ? typed.fields.rest : typed.fields.rest;
+      if (rest) addStatements(node.body, rest);
+      stack.push({ list: node.body, owner: node, indent: item.indent });
       return;
     }
 
     const node = typed ? PS.nodeFromTyped(typed) : null;
     if (!node) {
-      top().list.push(withComment(PS.statementNode(text), item.comment));
+      const added = addStatements(top().list, text);
+      if (item.comment != null && added.length) withComment(added[added.length - 1], item.comment);
+      settle();
       return;
     }
     if (node.type === 'if') {
       if (item.comment != null) node.comment = item.comment;
     } else if (typed.kind !== 'comment') withComment(node, item.comment);
+    if (typed.fields && typed.fields.doWhile) node.doWhile = true;
     top().list.push(node);
-    if (node.type === 'repeat' && typed.fields.rest) node.body.push(PS.statementNode(typed.fields.rest));
+    if ((node.type === 'repeat' || node.type === 'loop') && typed.fields.rest) addStatements(node.body, typed.fields.rest);
     if (PS.isContainer(node)) {
-      stack.push({ list: node.type === 'if' ? node.branches[0].body : node.body, owner: node, indent: item.indent });
+      const list = node.type === 'if' ? node.branches[0].body : node.body;
+      if (inline) {
+        addStatements(list, inline.body);
+        settle();
+        return;
+      }
+      pushBlock({ list, owner: node, indent: item.indent }, text);
+    } else {
+      settle();
     }
+  });
+
+  // C's `break` at the end of a case is how C stops falling through, not pseudocode.
+  PS.walk(nodes, (node) => {
+    if (node.type === 'case' && node.body.length > 1 && lastIn(node.body).type === 'break') node.body.pop();
+    delete node.doWhile;
   });
   return nodes;
 };
 
 /** Clipboard text → `{ nodes, caption }`: LaTeX (algorithmic) or plain pseudocode. */
 PS.parsePasted = function parsePasted(text) {
-  const source = String(text == null ? '' : text);
-  if (/\\(?:State|If|ElsIf|Elif|ElseIf|While|For|ForAll|Repeat|Procedure|Function|Return|begin\{algorithmic\})\b/.test(source)) {
+  let source = String(text == null ? '' : text).replace(/\r\n?/g, '\n');
+  // A Markdown code fence copied along with the code.
+  const fenced = source.trim().match(/^(`{3,}|~{3,})[^\n]*\n([\s\S]*?)\n?\1\s*$/);
+  if (fenced) source = fenced[2];
+  if (/\\(?:State|If|ElsIf|Elif|ElseIf|While|For|ForAll|ForEach|ParFor|Loop|Switch|Repeat|Procedure|Function|Return|begin\{algorithmic\})\b/.test(source)) {
     const model = PS.parseLatex(source);
-    return { nodes: model.nodes, caption: model.caption || '', latex: true };
+    return { nodes: model.nodes, caption: model.caption || '', latex: true, model };
   }
   return { nodes: PS.parsePlain(source), caption: '', latex: false };
 };
@@ -1278,13 +2013,14 @@ PS.parsePasted = function parsePasted(text) {
     if (isMath && !text.includes('$')) {
       // Constants and booleans are text, not a product of variables.
       if (/^[A-Z]{2,}[A-Z0-9_-]*$/.test(text) || /^(true|false)$/i.test(text)) return `\\textsc{${text.toLowerCase()}}`;
+      const plain = !text.includes('\\');
       const math = (segment) => {
-        const tex = PS.normalizeExpr(segment);
+        const tex = plain ? PS.plainMath(segment) : PS.normalizeExpr(segment);
         return comparison ? asComparison(tex) : tex;
       };
-      const plain = PS.normalizeOperators(text);
+      const source = PS.normalizeOperators(text);
       // Merge-Sort(A, p, r) inside an expression renders like \Call.
-      return PS.inlineWithCalls(plain, math) || `$${math(plain)}$`;
+      return PS.inlineWithCalls(source, math) || `$${math(source)}$`;
     }
     // Conditions mixing text and math ($a = b$ and $c$): `=` still means `==`.
     if (comparison) return text.replace(/\$([^$]*)\$/g, (all, inner) => `$${asComparison(inner)}$`);
@@ -1544,22 +2280,31 @@ PS.parsePasted = function parsePasted(text) {
 
   const MERGEABLE = new Set(['state', 'call', 'return', 'print', 'break', 'continue']);
 
+  /** A line's `\label` and highlight, kept on the row for `\ref` and styling. */
+  const meta = (holder, prefix = '') => ({
+    label: holder ? holder[PS.metaKey(prefix, 'label')] || null : null,
+    mark: !!(holder && holder[PS.metaKey(prefix, 'mark')]),
+  });
+
   function buildRows(nodes, depth, counter, rows) {
-    const row = (text, comment, numbered = true, extra = {}) => rows.push(Object.assign({
-      number: numbered ? ++counter.value : null,
-      depth,
-      text,
-      comment: comment || null,
-    }, extra));
+    const row = (text, comment, numbered = true, extra = {}) => {
+      if (numbered) counter.started = true;
+      rows.push(Object.assign({
+        number: numbered ? ++counter.value : null,
+        depth,
+        text,
+        comment: comment || null,
+      }, extra));
+    };
     const body = (list) => buildRows(list || [], depth + 1, counter, rows);
 
     for (const node of nodes) {
       switch (node.type) {
         case 'function': {
-          row(`\\fn{${node.name || ''}}(${expr(node.args, node.argsMath)})`, node.comment, false, { kind: 'function' });
-          // Each procedure numbers its own lines from 1.
+          row(`\\fn{${node.name || ''}}(${expr(node.args, node.argsMath)})`, node.comment, false, Object.assign({ kind: 'function' }, meta(node)));
+          // Each procedure numbers its own lines from 1 (a block's start option counts for the first).
           const saved = counter.value;
-          counter.value = 0;
+          if (counter.started) counter.value = 0;
           body(node.body);
           counter.value = saved;
           break;
@@ -1568,18 +2313,20 @@ PS.parsePasted = function parsePasted(text) {
         case 'if': {
           node.branches.forEach((branch, index) => {
             const comment = index === 0 ? node.comment || branch.comment : branch.comment;
-            row(`\\kw{${index === 0 ? 'if' : 'elseif'}} ${expr(branch.cond, branch.condMath, true)}`, comment);
+            row(`\\kw{${index === 0 ? 'if' : 'elseif'}} ${expr(branch.cond, branch.condMath, true)}`, comment, true, meta(index === 0 ? node : branch));
             body(branch.body);
           });
           if (node.elseBody) {
             // CLRS: a plain first statement goes on the else line ("else x = x.right"),
             // the rest of the branch below it.
             const [first, ...rest] = node.elseBody;
-            if (first && MERGEABLE.has(first.type) && !(first.comment && node.elseComment)) {
-              row(`\\kw{else} ${simpleText(first)}`, node.elseComment || first.comment);
+            const elseMeta = meta(node, 'else');
+            if (first && MERGEABLE.has(first.type) && !(first.comment && node.elseComment)
+              && !elseMeta.label && !first.label && elseMeta.mark === !!first.mark) {
+              row(`\\kw{else} ${simpleText(first)}`, node.elseComment || first.comment, true, elseMeta);
               body(rest);
             } else {
-              row('\\kw{else}', node.elseComment);
+              row('\\kw{else}', node.elseComment, true, elseMeta);
               body(node.elseBody);
             }
           }
@@ -1587,12 +2334,13 @@ PS.parsePasted = function parsePasted(text) {
         }
 
         case 'while':
-          row(`\\kw{while} ${expr(node.cond, node.condMath, true)}`, node.comment);
+          row(`\\kw{while} ${expr(node.cond, node.condMath, true)}`, node.comment, true, meta(node));
           body(node.body);
           break;
 
         case 'for': {
           let head;
+          const keyword = node.parallel && !node.all ? '\\kw{parallel for}' : '\\kw{for}';
           if (node.all) {
             // CLRS: "**for** each v ∈ G.V" (only "for" is bold). A head already written with text commands
             // (\texttt{child} of \texttt{u}) is prose; math mode would swallow its spaces.
@@ -1609,40 +2357,68 @@ PS.parsePasted = function parsePasted(text) {
             }
           } else {
             head = node.bound
-              ? `\\kw{for} ${expr(node.init, node.initMath)} \\kw{${node.downto ? 'downto' : 'to'}} ${expr(node.bound, node.boundMath)}`
-              : `\\kw{for} ${expr(node.init, node.initMath)}`;
+              ? `${keyword} ${expr(node.init, node.initMath)} \\kw{${node.downto ? 'downto' : 'to'}} ${expr(node.bound, node.boundMath)}`
+              : `${keyword} ${expr(node.init, node.initMath)}`;
           }
-          row(head, node.comment);
+          row(head, node.comment, true, meta(node));
           body(node.body);
           break;
         }
 
         case 'repeat':
-          row('\\kw{repeat}', node.comment);
+          row('\\kw{repeat}', node.comment, true, meta(node));
           body(node.body);
-          row(`\\kw{until} ${expr(node.until, node.untilMath, true)}`, node.untilComment);
+          row(`\\kw{until} ${expr(node.until, node.untilMath, true)}`, node.untilComment, true, meta(node, 'until'));
+          break;
+
+        case 'loop':
+          row('\\kw{loop}', node.comment, true, meta(node));
+          body(node.body);
+          break;
+
+        case 'switch':
+          row(`\\kw{switch} ${expr(node.cond, node.condMath)}`, node.comment, true, meta(node));
+          body(node.body);
+          break;
+
+        case 'case':
+          row(node.default ? '\\kw{default}' : `\\kw{case} ${expr(node.value, node.valueMath)}`, node.comment, true, meta(node));
+          body(node.body);
           break;
 
         case 'state':
           // CLRS numbers comment lines too.
-          if (!node.text && node.comment) row('', node.comment, true, { note: true });
-          else row(simpleText(node), node.comment);
+          if (!node.text && node.comment) row('', node.comment, true, Object.assign({ note: true }, meta(node)));
+          else row(simpleText(node), node.comment, true, meta(node));
           break;
+
+        case 'statex':
+          // \Statex: an unnumbered line (blank, or a heading).
+          row(expr(node.text, node.textMath), node.comment, false, Object.assign({ kind: 'statex' }, meta(node)));
+          break;
+
+        case 'counter': {
+          // \setcounter{ALG@line}{k}: the next line is numbered k + 1.
+          const next = parseInt(node.value, 10);
+          if (next >= 1) counter.value = next - 1;
+          counter.started = true;
+          break;
+        }
 
         case 'require':
         case 'ensure':
-          row(`\\kw{${node.type === 'require' ? 'Require' : 'Ensure'}:} ${expr(node.text, node.textMath)}`, node.comment, false);
+          row(`\\kw{${node.type === 'require' ? 'Require' : 'Ensure'}:} ${expr(node.text, node.textMath)}`, node.comment, false, meta(node));
           break;
 
         case 'comment': {
           const last = rows[rows.length - 1];
           if (last && !last.comment) last.comment = node.text || '';
-          else row('', node.text || '', true, { note: true });
+          else row('', node.text || '', true, Object.assign({ note: true }, meta(node)));
           break;
         }
 
         default:
-          row(simpleText(node) || '', node.comment);
+          row(simpleText(node) || '', node.comment, true, meta(node));
       }
     }
   }
@@ -1735,13 +2511,25 @@ PS.parsePasted = function parsePasted(text) {
 
   PS.buildRows = function buildRowsForModel(model) {
     const rows = [];
-    buildRows(model.nodes || [], 0, { value: 0 }, rows);
+    const start = parseInt(model.start, 10);
+    buildRows(model.nodes || [], 0, { value: start > 1 ? start - 1 : 0, started: false }, rows);
+    // \ref{name} → the number of the line carrying \label{name}.
+    const numbers = new Map(rows.filter((row) => row.label).map((row) => [row.label, row.number]));
+    const resolve = (text) => (text && text.includes('\\ref')
+      ? text.replace(/\\ref\{([^{}]*)\}/g, (all, name) => (numbers.get(name) != null ? String(numbers.get(name)) : '??'))
+      : text);
+    rows.forEach((row) => {
+      row.text = resolve(row.text);
+      row.comment = resolve(row.comment);
+    });
     return rows;
   };
 
   /** AST → DOM. Math is left as `.ps-math` placeholders for PS.typesetMath. */
   PS.renderBlock = function renderBlock(model, options) {
     const settings = Object.assign({ lineNumbers: true, indentSize: '1.2em', commentDelimiter: '//' }, options || {});
+    // Per-block option: \begin{algorithmic}[0] / [1].
+    if (typeof model.numbers === 'boolean') settings.lineNumbers = model.numbers;
     const block = el('div', 'ps-block');
     block.setCssProps({ '--ps-indent': settings.indentSize || '1.2em' });
 
@@ -1765,6 +2553,7 @@ PS.parsePasted = function parsePasted(text) {
       if (row.kind) lineClasses.push(`ps-row-${row.kind}`);
       if (row.kind === 'function' && index > 0) lineClasses.push('ps-fn-later');
       if (index > 0 && rows[index - 1].kind === 'function') lineClasses.push('ps-after-fn');
+      if (row.mark) lineClasses.push('ps-mark');
       const cell = (className, text) => {
         const node = el('span', className, text);
         lineClasses.forEach((name) => node.classList.add(name));
@@ -1820,11 +2609,24 @@ PS.parsePasted = function parsePasted(text) {
   const ALT = IS_MAC ? '⌥' : 'Alt+';
   const SHIFT = IS_MAC ? '⇧' : 'Shift+';
   const HISTORY_LIMIT = 100;
+  // Phones and tablets: no Tab key, so indenting goes through buttons and the ⋯ menu.
+  const TOUCH = typeof Platform !== 'undefined' && !!Platform.isMobile;
+  const INDENT_HINT = TOUCH ? '⇥ / ⇤ buttons: indent / outdent' : `Tab / ${SHIFT}Tab: indent / outdent`;
   // The focused window's document (the builder may open in a popout window).
   const activeDoc = () => (typeof activeDocument !== 'undefined' ? activeDocument : document);
 
   const hasCjk = (value) => /[一-鿿]/.test(String(value));
   const hasTex = (value) => /[\\$]/.test(String(value || ''));
+
+  /** Put text on the clipboard and say so. */
+  PS.copyText = async function copyText(text, message) {
+    try {
+      await navigator.clipboard.writeText(text);
+      new Notice(message || 'Copied');
+    } catch (error) {
+      new Notice(`Could not copy: ${error && error.message ? error.message : error}`);
+    }
+  };
 
   function cloneNode(node) {
     const copy = JSON.parse(JSON.stringify(node));
@@ -1837,8 +2639,16 @@ PS.parsePasted = function parsePasted(text) {
       case 'if': return PS.node('if', { branches: [{ cond: '', body: [] }], elseBody: null });
       case 'while': return PS.node('while', { cond: '', body: [] });
       case 'for': return PS.node('for', { init: '', bound: '', downto: false, body: [] });
+      case 'parfor': return PS.node('for', { parallel: true, init: '', bound: '', downto: false, body: [] });
       case 'forall': return PS.node('for', { all: true, init: '', bound: '', downto: false, body: [] });
       case 'repeat': return PS.node('repeat', { body: [], until: '' });
+      // No field of their own: they start with a first line to type in.
+      case 'loop': return PS.node('loop', { body: [newNode('state')] });
+      case 'default': return PS.node('case', { default: true, value: '', body: [newNode('state')] });
+      case 'switch': return PS.node('switch', { cond: '', body: [] });
+      case 'case': return PS.node('case', { value: '', body: [] });
+      case 'statex': return PS.node('statex', { text: '', textMath: false });
+      case 'counter': return PS.node('counter', { value: '' });
       case 'function': return PS.node('function', { kind: 'Procedure', name: '', args: '', body: [] });
       case 'call': return PS.node('call', { name: '', args: '' });
       case 'break':
@@ -1859,6 +2669,12 @@ PS.parsePasted = function parsePasted(text) {
     continue: { chip: 'continue', parts: [] },
     call: { chip: 'call', parts: [field('name', 'procedure name', false), '(', field('args', 'args, e.g. A, i'), ')'] },
     raw: { chip: 'raw', parts: [field('text', 'unrecognized raw line', false)] },
+    statex: { chip: 'text', parts: [field('text', 'unnumbered line, e.g. \\textbf{Phase 1}; empty for a blank line', false)] },
+    counter: { chip: 'line no.', parts: ['next line is number', field('value', 'e.g. 5', false)], noComment: true },
+    loop: { chip: 'loop', parts: [] },
+    switch: { chip: 'switch', parts: [field('cond', 'value, e.g. op')] },
+    case: { chip: 'case', parts: [field('value', 'value, e.g. 1')] },
+    default: { chip: 'default', parts: [] },
     comment: { chip: '//', parts: [field('text', 'comment text', false)], noComment: true },
     while: { chip: 'while', parts: [field('cond', 'condition, e.g. i > 0 and A[i] > key')] },
     forall: { chip: 'for each', parts: [field('init', 'element in set, e.g. v in G.V')] },
@@ -1866,6 +2682,14 @@ PS.parsePasted = function parsePasted(text) {
       chip: 'for',
       parts: [
         field('init', 'start, e.g. j = 2'),
+        { select: 'downto', options: [['to', false], ['downto', true]] },
+        field('bound', 'end, e.g. n'),
+      ],
+    },
+    parfor: {
+      chip: 'parallel for',
+      parts: [
+        field('init', 'start, e.g. i = 1'),
         { select: 'downto', options: [['to', false], ['downto', true]] },
         field('bound', 'end, e.g. n'),
       ],
@@ -1885,8 +2709,10 @@ PS.parsePasted = function parsePasted(text) {
     ['Return', 'return'], ['Call', 'call'], ['Procedure', 'function'],
   ];
   const MORE_INSERTS = [
-    ['For each', 'forall'], ['Repeat … until', 'repeat'], ['Require', 'require'], ['Ensure', 'ensure'],
-    ['Break', 'break'], ['Continue', 'continue'], ['Print', 'print'], ['Comment line', 'comment'],
+    ['For each', 'forall'], ['Repeat … until', 'repeat'], ['Loop', 'loop'], ['Parallel for', 'parfor'],
+    ['Switch', 'switch'], ['Case', 'case'], ['Default case', 'default'],
+    ['Require', 'require'], ['Ensure', 'ensure'], ['Break', 'break'], ['Continue', 'continue'], ['Print', 'print'],
+    ['Comment line', 'comment'], ['Unnumbered line', 'statex'], ['Set line number', 'counter'],
   ];
 
   /* ---- help ---- */
@@ -1897,16 +2723,19 @@ PS.parsePasted = function parsePasted(text) {
     ['else · else if y < 0', 'A branch of the if above'],
     ['for i = 1 to n', 'A for loop: typing “ to ” or “ downto ” jumps to the end value'],
     ['for each v in G.V', 'A for-each loop'],
-    ['while i > 0 · repeat · until done', 'Loops; until closes the repeat above'],
+    ['while i > 0 · repeat · until done · loop', 'Loops; until closes the repeat above'],
+    ['parallel for i = 1 to n', 'A parallel loop (CLRS multithreading); spawn and sync are bold'],
+    ['switch x · case 1: · default:', 'A switch and its cases'],
     ['return x · break · continue', 'Statements'],
     ['procedure Max-Heapify(A, i)', 'A procedure: typing ( jumps to the parameters'],
     ['// note', 'A comment line; x = 0 // note adds a comment to a line'],
     ['end · }', 'Leaves the block (so does Enter on an empty last line)'],
+    ['如果 · 否则 · 对于 i = 1 到 n · 当 · 返回', 'Chinese keywords work too (重复 / 直到, 跳出, 继续, 过程 …)'],
   ];
   const HELP_KEYS = [
     ['Enter', 'New line (inside a block head: its first line)'],
     ['Backspace', 'On an empty line: delete it. At the start of a block head: back to a plain line'],
-    [`Tab · ${SHIFT}Tab`, 'Indent · outdent'],
+    [TOUCH ? '⇥ · ⇤' : `Tab · ${SHIFT}Tab`, 'Indent · outdent'],
     [`${ALT}↑ · ${ALT}↓`, 'Move the line'],
     ['↑ · ↓', 'Previous · next field'],
     [`${MOD}/`, 'Show or hide the comment field'],
@@ -1919,7 +2748,10 @@ PS.parsePasted = function parsePasted(text) {
     ['<= · >= · != · ==', '≤ · ≥ · ≠ · comparison (a single = is assignment)'],
     ['NIL · TRUE · FALSE', 'Constants, in small caps'],
     ['Insertion-Sort(A)', 'Calls: capitalized names with ( are set in small caps'],
-    ['key · heap-size', 'Variable names in italic, as in CLRS'],
+    ['key · heap-size · heap_size', 'Variable names in italic, as in CLRS'],
+    ['floor(n/2) · ceil(x) · sqrt(n) · abs(x)', '⌊n/2⌋ · ⌈x⌉ · √n · |x|'],
+    ['inf · None · n**2 · !done', '∞ · NIL · n² · not done'],
+    ['i % 2 · S ∪ {u} · cost $5', 'Written as typed: no need to escape TeX characters'],
   ];
 
   function renderHelp(parent) {
@@ -1941,7 +2773,11 @@ PS.parsePasted = function parsePasted(text) {
     section('Writing expressions', HELP_MATH);
     parent.createDiv({
       cls: 'pb-help-note',
-      text: 'Paste several lines (Python or C style, CLRS with line numbers, or algorithmicx LaTeX) into any line or the title to import them as rows.',
+      text: 'Paste several lines (Python, C, Java or Pascal, CLRS with line numbers, Chinese pseudocode, or algorithmicx LaTeX) into any line or the title to import them as rows.',
+    });
+    parent.createDiv({
+      cls: 'pb-help-note',
+      text: 'The ⋯ menu of a line can highlight it or give it a label; write \\ref{label} in any line or comment to show that line’s number.',
     });
   }
 
@@ -1953,7 +2789,7 @@ PS.parsePasted = function parsePasted(text) {
     if (kind === 'until') return 'Enter: new line after the loop';
     switch (node && node.type) {
       case 'state':
-        if (!empty) return `Enter: new line · type “ // ” to add a comment · Tab / ${SHIFT}Tab: indent / outdent · ${ALT}↑↓: move`;
+        if (!empty) return TOUCH ? `Enter: new line · type “ // ” to add a comment · ${INDENT_HINT}` : `Enter: new line · type “ // ” to add a comment · ${INDENT_HINT} · ${ALT}↑↓: move`;
         return nested
           ? 'Type if / for / while / else / return / // … to make a block · Enter on this empty line leaves the block · Backspace deletes it'
           : 'Type if / for / while / repeat / return / procedure / // … to make a block · or paste several lines';
@@ -1968,8 +2804,16 @@ PS.parsePasted = function parsePasted(text) {
         return key === 'name' ? 'Type ( to jump to the parameters' : 'Enter: first line of the procedure';
       case 'call':
         return key === 'name' ? 'Type ( to jump to the arguments' : 'Enter: new line';
+      case 'switch':
+        return 'Enter: first line inside · type case 1: or default: to add cases';
+      case 'case':
+        return 'Enter: first line of this case · type case or default on a line below for the next one';
+      case 'counter':
+        return 'The number the next line gets (as \\setcounter{ALG@line} in LaTeX)';
+      case 'statex':
+        return 'An unnumbered line: a heading, or empty for a blank line';
       default:
-        return `Enter: new line · Tab / ${SHIFT}Tab: indent / outdent · ${MOD}Z: undo · ${MOD}Enter: save`;
+        return TOUCH ? `Enter: new line · ${INDENT_HINT}` : `Enter: new line · ${INDENT_HINT} · ${MOD}Z: undo · ${MOD}Enter: save`;
     }
   }
 
@@ -2009,8 +2853,41 @@ PS.parsePasted = function parsePasted(text) {
     if (Array.isArray(value)) { value.forEach(markSourceProse); return; }
     if (!value || typeof value !== 'object') return;
     for (const [key, child] of Object.entries(value)) {
-      if (key.endsWith('Math') && child === false) value[`${key.slice(0, -4)}Prose`] = true;
+      // An empty field (`\State \text{}`, a saved blank line) is not prose yet.
+      if (key.endsWith('Math') && child === false && String(value[key.slice(0, -4)] || '').trim()) value[`${key.slice(0, -4)}Prose`] = true;
       else if (child && typeof child === 'object') markSourceProse(child);
+    }
+  }
+
+  /** One-line text input (a line's label). */
+  class PromptModal extends Modal {
+    constructor(app, { title, value, placeholder, onSubmit }) {
+      super(app);
+      Object.assign(this, { heading: title, value: value || '', placeholder: placeholder || '', onSubmit });
+    }
+
+    onOpen() {
+      this.titleEl.setText(this.heading);
+      const input = this.contentEl.createEl('input', { cls: 'pb-prompt-input', attr: { type: 'text', placeholder: this.placeholder, spellcheck: 'false' } });
+      input.value = this.value;
+      const buttons = this.contentEl.createDiv('modal-button-container');
+      const submit = () => {
+        this.onSubmit(input.value.trim());
+        this.close();
+      };
+      buttons.createEl('button', { text: 'Cancel' }).addEventListener('click', () => this.close());
+      buttons.createEl('button', { cls: 'mod-cta', text: 'OK' }).addEventListener('click', submit);
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && !event.isComposing) {
+          event.preventDefault();
+          submit();
+        }
+      });
+      window.setTimeout(() => input.focus(), 0);
+    }
+
+    onClose() {
+      this.contentEl.empty();
     }
   }
 
@@ -2039,6 +2916,8 @@ PS.parsePasted = function parsePasted(text) {
       this.previewToken = 0;
       this.previewComponent = null;
       this.forceClose = false;
+      // Converting text: saving always writes the block, even with nothing edited.
+      this.alwaysDirty = !!options.dirty;
     }
 
     onOpen() {
@@ -2067,7 +2946,7 @@ PS.parsePasted = function parsePasted(text) {
     }
 
     isDirty() {
-      return PS.serializeLatex(this.model) !== this.initialLatex;
+      return this.alwaysDirty || PS.serializeLatex(this.model) !== this.initialLatex;
     }
 
     /** Esc, the close button and clicking outside all land here. */
@@ -2125,6 +3004,8 @@ PS.parsePasted = function parsePasted(text) {
         if (this.pasteLines(null, text)) event.preventDefault();
       });
 
+      this.renderOptions(left.createDiv('pb-options'));
+
       const toolbar = left.createDiv('pb-toolbar');
       PRIMARY_INSERTS.forEach(([label, type]) => {
         const button = toolbar.createEl('button', { text: `+ ${label}` });
@@ -2136,6 +3017,18 @@ PS.parsePasted = function parsePasted(text) {
         MORE_INSERTS.forEach(([label, type]) => menu.addItem((item) => item.setTitle(label).onClick(() => this.insertNode(newNode(type)))));
         this.showMenu(menu, event, more);
       });
+      if (TOUCH) {
+        // No Tab key on a touch keyboard.
+        const current = () => (this.selected ? this.index.get(this.selected.id) : null);
+        [['⇤', 'Outdent', (node) => this.outdent(node)], ['⇥', 'Indent', (node) => this.indent(node)]].forEach(([text, label, run]) => {
+          const button = toolbar.createEl('button', { text, attr: { 'aria-label': `${label} the selected line` } });
+          button.addEventListener('mousedown', (event) => event.preventDefault()); // keep the keyboard up
+          button.addEventListener('click', () => {
+            const info = current();
+            if (info) run(info.node);
+          });
+        });
+      }
 
       this.listEl = left.createDiv('pb-list');
       this.listEl.addEventListener('focusin', (event) => {
@@ -2147,6 +3040,9 @@ PS.parsePasted = function parsePasted(text) {
       const details = right.createEl('details', { cls: 'pb-latex' });
       details.createEl('summary', { text: 'Generated LaTeX' });
       this.latexEl = details.createEl('pre');
+      const copy = details.createEl('button', { cls: 'pb-copy-latex', text: 'Copy for a LaTeX document' });
+      copy.setAttribute('aria-label', 'Copy as standard algorithm / algpseudocode LaTeX, with the preamble it needs');
+      copy.addEventListener('click', () => PS.copyText(PS.exportLatex(this.model), 'LaTeX copied (preamble lines are at the top)'));
 
       // Tips stay open until closed once (remembered in the settings).
       this.helpEl = right.createEl('details', { cls: 'pb-help' });
@@ -2177,6 +3073,34 @@ PS.parsePasted = function parsePasted(text) {
       contentEl.addEventListener('input', () => this.updateHint());
       footer.createEl('button', { text: 'Cancel' }).addEventListener('click', () => this.close());
       footer.createEl('button', { cls: 'mod-cta', text: 'Save' }).addEventListener('click', () => this.save());
+    }
+
+    /** Numbering for this block: the setting, always or never; and the first line number. */
+    renderOptions(parent) {
+      const numbering = parent.createEl('label');
+      numbering.appendText('Line numbers');
+      const select = numbering.createEl('select', { cls: 'dropdown pb-select' });
+      [['Default', ''], ['Shown', 'on'], ['Hidden', 'off']].forEach(([label, value]) => {
+        const option = select.createEl('option', { text: label, value });
+        const current = this.model.numbers === true ? 'on' : this.model.numbers === false ? 'off' : '';
+        if (current === value) option.selected = true;
+      });
+      select.addEventListener('change', () => this.mutate(() => {
+        if (select.value === 'on') this.model.numbers = true;
+        else if (select.value === 'off') this.model.numbers = false;
+        else delete this.model.numbers;
+      }));
+      const startLabel = parent.createEl('label');
+      startLabel.appendText('Start at');
+      const start = startLabel.createEl('input', { cls: 'pb-start', attr: { type: 'number', min: '1', placeholder: '1' } });
+      start.value = this.model.start ? String(this.model.start) : '';
+      start.addEventListener('input', () => {
+        this.beginTyping('start');
+        const value = parseInt(start.value, 10);
+        if (value > 1) this.model.start = value;
+        else delete this.model.start;
+        this.schedulePreview();
+      });
     }
 
     /** Say what the keyboard does in the focused field. */
@@ -2343,10 +3267,14 @@ PS.parsePasted = function parsePasted(text) {
       }
       // `if x > 0 then`, `while (i < n) {`: drop what other dialects put around a condition.
       const holder = key === 'cond' && node.type === 'if' ? node.branches[Number.isInteger(row.slot) ? row.slot : 0]
-        : (key === 'cond' || key === 'until' || key === 'init' || key === 'bound') ? node : null;
+        : (key === 'cond' || key === 'until' || key === 'init' || key === 'bound' || key === 'value') ? node : null;
       if (holder && typeof holder[key] === 'string') {
         const clean = PS.cleanCondition(holder[key]);
-        if (clean !== holder[key].trim()) holder[key] = clean;
+        if (clean !== holder[key].trim()) {
+          holder[key] = clean;
+          // `i > 0 时`: the Chinese word that made it plain text is gone.
+          if (!holder[`${key}Prose`] && clean) holder[`${key}Math`] = !hasCjk(clean);
+        }
       }
       if (PS.isContainer(node) && row.kind !== 'until' && !shift) this.addInside(node, row.slot);
       else this.addAfter(node);
@@ -2377,7 +3305,9 @@ PS.parsePasted = function parsePasted(text) {
         if (!previous) this.captionInput.focus();
         return true;
       }
-      const field = { if: 'cond', while: 'cond', for: 'init', return: 'text', print: 'text', require: 'text', ensure: 'text' }[node.type];
+      const field = {
+        if: 'cond', while: 'cond', for: 'init', return: 'text', print: 'text', require: 'text', ensure: 'text', switch: 'cond', case: 'value',
+      }[node.type];
       if (!field || key !== field) return false;
       if (node.type === 'if' && (node.branches.length > 1 || node.elseBody)) return false;
       const source = node.type === 'if' ? node.branches[0] : node;
@@ -2443,6 +3373,27 @@ PS.parsePasted = function parsePasted(text) {
       if (node.type === 'state' && part.key === 'text' && row.kind === 'node') {
         const typed = PS.typedLine(value);
         return typed && !PS.typedLine(previous) ? this.applyTyped(node, typed) : false;
+      }
+      if (node.type === 'for' && part.key === 'init') {
+        // `for (int i = 0; i < n; i++)` (C) or `for i in range(1, n)` (Python), once complete:
+        // a counting loop with CLRS bounds.
+        const counted = (text) => /\)\s*$/.test(text) && /;|\brange\s*\(/.test(text) && PS.splitForHead(text).fields.split;
+        if (counted(value) && !counted(previous)) {
+          const head = PS.splitForHead(value);
+          this.mutate(() => {
+            Object.assign(node, {
+              all: false,
+              init: PS.normalizeOperators(head.fields.init),
+              initMath: true,
+              bound: PS.normalizeOperators(head.fields.bound),
+              boundMath: true,
+              downto: !!head.fields.downto,
+            });
+            this.pendingFocus = `${node.id}::bound`;
+            this.pendingCaret = 'end';
+          });
+          return true;
+        }
       }
       if (node.type === 'for' && !node.all && part.key === 'init') {
         if (fresh(/^\s*(?:each|all)\s/i) || fresh(/^[^\s=]+\s+(?:in|∈)\s/i)) {
@@ -2567,12 +3518,22 @@ PS.parsePasted = function parsePasted(text) {
       if (!replacement) return false;
       this.mutate(() => {
         if (carry != null && replacement.type !== 'comment') replacement.comment = carry;
-        info.array.splice(info.index, 1, replacement);
+        if (replacement.type === 'case' && info.parent && info.parent.type === 'case') {
+          // `case 2:` typed inside the case above starts the next case of the same switch,
+          // taking the lines below it along.
+          const owner = this.index.get(info.parent.id);
+          replacement.body.push(...info.array.splice(info.index).slice(1));
+          owner.array.splice(owner.index + 1, 0, replacement);
+        } else {
+          info.array.splice(info.index, 1, replacement);
+        }
         const fieldless = replacement.type === 'break' || replacement.type === 'continue';
-        if (replacement.type === 'repeat') {
+        const headless = replacement.type === 'repeat' || replacement.type === 'loop' || (replacement.type === 'case' && replacement.default);
+        if (headless || (replacement.type === 'case' && fields.rest)) {
+          // No condition to type yet (or one already given): straight to the first line.
           const rest = String(fields.rest || '');
-          const first = rest.trim() ? PS.statementNode(rest) : newNode('state');
-          replacement.body.push(first);
+          const first = rest.trim() ? PS.lineNode(rest) : newNode('state');
+          replacement.body.unshift(first);
           this.focusNew(first, 'end');
         } else if (enter || fieldless) {
           // Enter on `return` / `break`: next line; on a block head: its first line.
@@ -2727,7 +3688,7 @@ PS.parsePasted = function parsePasted(text) {
           return;
 
         default: {
-          const spec = ROWS[node.type === 'for' && node.all ? 'forall' : node.type] || ROWS.raw;
+          const spec = ROWS[specKey(node)] || ROWS.raw;
           this.renderRow({
             node, depth, chip: spec.chip, parts: spec.parts,
             comment: spec.noComment ? null : { target: node, key: 'comment' },
@@ -2775,6 +3736,10 @@ PS.parsePasted = function parsePasted(text) {
       }
 
       element.createSpan({ cls: `pb-chip pb-chip-${kind === 'node' ? node.type : kind}`, text: chip });
+      const { holder, prefix } = metaAccess(row);
+      if (holder[PS.metaKey(prefix, 'mark')]) element.addClass('pb-marked');
+      const label = holder[PS.metaKey(prefix, 'label')];
+      if (label) element.setAttribute('title', `Label: ${label} (\\ref{${label}} shows this line's number)`);
       const fields = element.createDiv('pb-fields');
       parts.forEach((part) => this.renderPart(fields, row, target, part));
       if (comment) this.renderComment(fields, row);
@@ -2947,6 +3912,25 @@ PS.parsePasted = function parsePasted(text) {
       item('Outdent', 'outdent', () => this.outdent(node), `${SHIFT}Tab`);
       menu.addSeparator();
       if (this.commentAccess(row)) item('Trailing comment', 'message-square', () => this.toggleComment(row), `${MOD}/`);
+      if (node.type !== 'counter') {
+        const { holder, prefix } = metaAccess(row);
+        const markKey = PS.metaKey(prefix, 'mark');
+        const labelKey = PS.metaKey(prefix, 'label');
+        item(holder[markKey] ? 'Remove highlight' : 'Highlight line', 'highlighter', () => this.mutate(() => {
+          if (holder[markKey]) delete holder[markKey];
+          else holder[markKey] = true;
+        }));
+        item(holder[labelKey] ? `Label: ${holder[labelKey]}…` : 'Label for \\ref…', 'tag', () => new PromptModal(this.app, {
+          title: 'Line label',
+          value: holder[labelKey] || '',
+          placeholder: 'e.g. loop-test; write \\ref{loop-test} to show this line’s number',
+          onSubmit: (value) => this.mutate(() => {
+            const clean = value.replace(/[{}\\\s]+/g, '-');
+            if (clean) holder[labelKey] = clean;
+            else delete holder[labelKey];
+          }),
+        }).open());
+      }
       item('Duplicate', 'copy', () => this.duplicate(node), `${MOD}${SHIFT}D`);
       item(kind === 'branch' ? 'Remove this branch' : kind === 'else' ? 'Remove else' : 'Delete', 'trash-2', () => this.removeRow(row), `${MOD}${SHIFT}K`);
       return menu;
@@ -3033,8 +4017,14 @@ PS.parsePasted = function parsePasted(text) {
     /** Focus a node's first field after the next render (`caret`: a position or 'end'). */
     focusNew(node, caret) {
       this.selected = { id: node.id };
+      // Blocks without a field of their own (loop, default) start at their first line.
+      if ((node.type === 'loop' || (node.type === 'case' && node.default)) && node.body.length) {
+        this.focusNew(node.body[0], caret);
+        return;
+      }
       const first = {
         if: '0:cond', while: ':cond', for: ':init', repeat: 'until:until', function: ':name', call: ':name',
+        switch: ':cond', case: ':value', counter: ':value',
       }[node.type] || ':text';
       this.pendingFocus = `${node.id}:${first}`;
       this.pendingCaret = caret == null ? null : caret;
@@ -3224,7 +4214,22 @@ PS.parsePasted = function parsePasted(text) {
   }
 
   /** Keyword lines that only mean something once Enter ends them. */
-  const BARE_KEYWORD = /^\s*(?:\}\s*)?(?:else(?:\s*if)?|elseif|elif|elsif|repeat|return|break|continue|end(?:\s+\w+)?|endif|endwhile|endfor|fi|od|done|\})\s*[:{;]?\s*$/i;
+  const BARE_KEYWORD = /^\s*(?:\}\s*)?(?:else(?:\s*if)?|elseif|elif|elsif|repeat|loop|do|default|otherwise|return|break|continue|end(?:\s+\w+)?|endif|endwhile|endfor|endloop|fi|od|done|\}|否则|重复|循环|跳出(?:循环)?|中断|继续|返回|其他情况|结束(?:如果|循环|过程|函数|算法)?)\s*[:：{;]?\s*$/i;
+
+  /** The ROWS layout of a node. */
+  function specKey(node) {
+    if (node.type === 'for') return node.all ? 'forall' : node.parallel ? 'parfor' : 'for';
+    if (node.type === 'case') return node.default ? 'default' : 'case';
+    return node.type;
+  }
+
+  /** Where a row's label and highlight live (see PS.metaKey). */
+  function metaAccess({ node, slot, kind }) {
+    if (node.type === 'if' && kind === 'else') return { holder: node, prefix: 'else' };
+    if (node.type === 'if' && Number.isInteger(slot) && slot > 0) return { holder: node.branches[slot], prefix: '' };
+    if (kind === 'until') return { holder: node, prefix: 'until' };
+    return { holder: node, prefix: '' };
+  }
 
   function parseSlot(value) {
     if (value == null || value === '') return undefined;
@@ -3232,6 +4237,7 @@ PS.parsePasted = function parsePasted(text) {
   }
 
   PS.BuilderModal = BuilderModal;
+  PS.PromptModal = PromptModal;
   PS.builderHint = hintFor;
   PS.ConfirmModal = ConfirmModal;
 })(PS);
@@ -3292,6 +4298,33 @@ function locateFence(lines, source, hint) {
   if (!matches.length) return null;
   if (!Number.isInteger(hint)) return matches[0];
   return matches.reduce((best, fence) => (Math.abs(fence.start - hint) < Math.abs(best.start - hint) ? fence : best));
+}
+
+/** Any fenced code block (not only ```pseudo) around `line`: { start, end, prefix, language, source }. */
+function codeFenceAt(lines, line) {
+  for (let i = 0; i < lines.length; i++) {
+    const open = lines[i].match(/^((?:[ \t]*>)*[ \t]*)(`{3,}|~{3,})[ \t]*([^\s`]*)[^`]*$/);
+    if (!open) continue;
+    const prefix = open[1];
+    const depth = (prefix.match(/>/g) || []).length;
+    const marker = open[2];
+    const close = new RegExp(`^(?:[ \\t]*>){${depth}}[ \\t]*${marker[0] === '`' ? '`' : '~'}{${marker.length},}[ \\t]*$`);
+    const strip = depth ? new RegExp(`^(?:[ \\t]*>){${depth}} ?`) : new RegExp(`^[ \\t]{0,${prefix.length}}`);
+    let end = i + 1;
+    while (end < lines.length && !close.test(lines[end])) end++;
+    if (end >= lines.length) return null;
+    if (i <= line && line <= end) {
+      return {
+        start: i,
+        end,
+        prefix: depth ? prefix.replace(/[ \t]*$/, ' ') : prefix,
+        language: open[3].toLowerCase(),
+        source: lines.slice(i + 1, end).map((text) => text.replace(strip, '')).join('\n'),
+      };
+    }
+    i = end;
+  }
+  return null;
 }
 
 /** Replacement lines for a fence's content, re-applying its prefix. */
@@ -3391,13 +4424,46 @@ class PseudocodeSuitePlugin extends Plugin {
         return true;
       },
     });
+    this.addCommand({
+      id: 'convert-to-pseudocode',
+      name: 'Convert selection or code block to pseudocode',
+      editorCheckCallback: (checking, editor, view) => {
+        const source = this.convertibleAt(editor);
+        if (checking) return !!source;
+        if (source) this.openConvert(editor, source, view);
+        return true;
+      },
+    });
+    this.addCommand({
+      id: 'copy-pseudocode-latex',
+      name: 'Copy pseudocode block as LaTeX',
+      editorCheckCallback: (checking, editor) => {
+        const fence = this.fenceAtCursor(editor);
+        if (checking) return !!fence;
+        if (fence) this.copyLatex(fence.source);
+        return true;
+      },
+    });
     this.registerEvent(this.app.workspace.on('editor-menu', (menu, editor, view) => {
       const fence = this.fenceAtCursor(editor);
-      if (!fence) return;
-      menu.addItem((item) => item
-        .setTitle('Edit pseudocode block')
-        .setIcon('square-pen')
-        .onClick(() => this.openEditorFence(editor, fence, view)));
+      if (fence) {
+        menu.addItem((item) => item
+          .setTitle('Edit pseudocode block')
+          .setIcon('square-pen')
+          .onClick(() => this.openEditorFence(editor, fence, view)));
+        menu.addItem((item) => item
+          .setTitle('Copy pseudocode as LaTeX')
+          .setIcon('copy')
+          .onClick(() => this.copyLatex(fence.source)));
+        return;
+      }
+      const source = this.convertibleAt(editor);
+      if (source) {
+        menu.addItem((item) => item
+          .setTitle(source.fence ? 'Convert code block to pseudocode' : 'Convert selection to pseudocode')
+          .setIcon('square-pen')
+          .onClick(() => this.openConvert(editor, source, view)));
+      }
     }));
   }
 
@@ -3478,7 +4544,18 @@ class PseudocodeSuitePlugin extends Plugin {
   }
 
   addEditButton(block, entry) {
-    const button = block.createEl('button', {
+    const bar = block.createDiv('ps-actions');
+    const copy = bar.createEl('button', {
+      cls: 'ps-edit-btn ps-copy-btn',
+      attr: { type: 'button', 'aria-label': 'Copy as LaTeX (algorithm + algpseudocode)' },
+    });
+    setIcon(copy.createSpan('ps-edit-icon'), 'copy');
+    copy.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.copyLatex(entry.source);
+    });
+    const button = bar.createEl('button', {
       cls: 'ps-edit-btn',
       attr: { type: 'button', 'aria-label': 'Edit in pseudocode builder' },
     });
@@ -3493,12 +4570,16 @@ class PseudocodeSuitePlugin extends Plugin {
     });
   }
 
+  copyLatex(source) {
+    PS.copyText(PS.exportLatex(PS.parseLatex(source)), 'LaTeX copied (the preamble it needs is in the comment on top)');
+  }
+
   /* ---------------- opening the builder ---------------- */
 
-  openBuilder(model, sourcePath, onSave) {
-    new PS.BuilderModal(this.app, {
+  openBuilder(model, sourcePath, onSave, options = {}) {
+    new PS.BuilderModal(this.app, Object.assign({
       model, settings: this.settings, sourcePath, onSave, saveSettings: (patch) => this.saveSettingsOnly(patch),
-    }).open();
+    }, options)).open();
   }
 
   /** Edit a block of a file on disk (reading view, live preview, embeds). */
@@ -3506,6 +4587,10 @@ class PseudocodeSuitePlugin extends Plugin {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) {
       new Notice(`File not found: ${path}`);
+      return;
+    }
+    if (file.extension === 'canvas') {
+      await this.openCanvasFence(file, source);
       return;
     }
     const fence = locateFence((await this.app.vault.read(file)).split(/\r?\n/), source, hint);
@@ -3530,6 +4615,102 @@ class PseudocodeSuitePlugin extends Plugin {
       if (!found) throw new Error('the block changed in the meantime');
       new Notice('Pseudocode updated');
     });
+  }
+
+  /**
+   * A block on a canvas card. Canvas files are JSON: the card's text is found by
+   * content and written back with only that string changed. An open canvas is
+   * updated through its view when it offers one, so it does not save over the change.
+   */
+  async openCanvasFence(file, source) {
+    const cardWith = (data) => (data.nodes || []).find((node) => node.type === 'text' && typeof node.text === 'string'
+      && locateFence(node.text.split(/\r?\n/), source, null));
+    let data;
+    try {
+      data = JSON.parse(await this.app.vault.read(file));
+    } catch (error) {
+      new Notice(`Could not read the canvas: ${error.message}`);
+      return;
+    }
+    const card = cardWith(data);
+    if (!card) {
+      new Notice('Could not find this pseudocode block on the canvas. Reopen it and try again.');
+      return;
+    }
+    const fence = locateFence(card.text.split(/\r?\n/), source, null);
+    this.openBuilder(PS.parseLatex(fence.source), file.path, async (latex) => {
+      const rewrite = (text) => {
+        const lines = text.split(/\r?\n/);
+        const current = locateFence(lines, fence.source, fence.start);
+        if (!current) return null;
+        return lines.slice(0, current.start + 1).concat(prefixed(latex, current.prefix), lines.slice(current.end)).join('\n');
+      };
+      // An open canvas keeps its own copy: change the card there.
+      const view = this.app.workspace.getLeavesOfType('canvas').map((leaf) => leaf.view)
+        .find((candidate) => candidate && candidate.file === file && candidate.canvas && candidate.canvas.nodes);
+      const live = view ? Array.from(view.canvas.nodes.values()).find((node) => node.id === card.id) : null;
+      if (live && typeof live.setText === 'function' && typeof live.text === 'string') {
+        const next = rewrite(live.text);
+        if (next == null) throw new Error('the block changed in the meantime');
+        live.setText(next);
+        if (typeof view.canvas.requestSave === 'function') view.canvas.requestSave();
+        new Notice('Pseudocode updated');
+        return;
+      }
+      let found = true;
+      await this.app.vault.process(file, (content) => {
+        const parsed = JSON.parse(content);
+        const node = (parsed.nodes || []).find((candidate) => candidate.id === card.id);
+        const next = node && typeof node.text === 'string' ? rewrite(node.text) : null;
+        if (next == null) {
+          found = false;
+          return content;
+        }
+        // Replace only the card's text, keeping Obsidian's formatting of the file.
+        const before = JSON.stringify(node.text);
+        if (content.includes(before)) return content.replace(before, () => JSON.stringify(next));
+        node.text = next;
+        return JSON.stringify(parsed, null, '\t');
+      });
+      if (!found) throw new Error('the block changed in the meantime');
+      new Notice('Pseudocode updated');
+    });
+  }
+
+  /** What "convert to pseudocode" would read: the selection, else the code block at the cursor. */
+  convertibleAt(editor) {
+    if (!editor) return null;
+    const selection = editor.getSelection();
+    if (selection && selection.trim()) {
+      return { text: selection, from: editor.getCursor('from'), to: editor.getCursor('to') };
+    }
+    const fence = codeFenceAt(editor.getValue().split(/\r?\n/), editor.getCursor().line);
+    if (!fence || fence.language === 'pseudo' || !fence.source.trim()) return null;
+    return { text: fence.source, fence };
+  }
+
+  /** Open the builder on pasted-style text; Save replaces it with a ```pseudo block. */
+  openConvert(editor, source, view) {
+    const parsed = PS.parsePasted(source.text);
+    const model = parsed.model || { caption: parsed.caption || '', nodes: parsed.nodes };
+    const path = view && view.file ? view.file.path : this.app.workspace.getActiveFile()?.path || '';
+    const original = source.text;
+    this.openBuilder(model, path, (latex) => {
+      if (source.fence) {
+        const lines = editor.getValue().split(/\r?\n/);
+        const current = codeFenceAt(lines, source.fence.start);
+        if (!current || current.source !== original) throw new Error('the code block changed in the meantime');
+        const marker = lines[current.start].match(/`{3,}|~{3,}/)[0];
+        const block = [`${current.prefix}${marker}pseudo`, ...prefixed(latex, current.prefix), `${current.prefix}${marker}`];
+        editor.replaceRange(block.join('\n'), { line: current.start, ch: 0 }, { line: current.end, ch: lines[current.end].length });
+      } else {
+        if (editor.getRange(source.from, source.to) !== original) throw new Error('the selection changed in the meantime');
+        const before = editor.getLine(source.from.line).slice(0, source.from.ch).trim() ? '\n' : '';
+        const after = editor.getLine(source.to.line).slice(source.to.ch).trim() ? '\n' : '';
+        editor.replaceRange(`${before}\`\`\`pseudo\n${latex}\n\`\`\`${after}`, source.from, source.to);
+      }
+      new Notice('Converted to pseudocode');
+    }, { dirty: true });
   }
 
   fenceAtCursor(editor) {

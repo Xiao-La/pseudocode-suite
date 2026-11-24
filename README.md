@@ -4,7 +4,8 @@ Write algorithms the way *Introduction to Algorithms* (CLRS) prints them, withou
 
 - **Renders** ` ```pseudo ` code blocks (an algorithmicx-style LaTeX subset) in CLRS typography: bold keywords, numbered lines, small-caps procedure names and constants, aligned `//` comments, Computer Modern fonts.
 - **Builds** them visually. Type `if x > 0`, `for i = 1 to n` or `else` and the line becomes the block you meant. Paste pseudocode from anywhere (Python, C, CLRS with line numbers, LaTeX) and it is parsed into rows. A live preview shows the result.
-- **Edits** any existing block in place, including blocks inside callouts and quotes.
+- **Edits** any existing block in place, including blocks inside callouts, quotes and Canvas cards.
+- **Converts** a selection or a code block (Python, C, Java, Pascal, Chinese pseudocode…) into a pseudocode block, and **copies** any block as LaTeX for a paper (`algorithm` + `algpseudocode`).
 
 ![A rendered pseudocode block: Stack-Empty, Push and Pop with numbered lines, bold keywords and small-caps names, plus the Edit button](docs/images/rendered-block.webp)
 
@@ -21,6 +22,8 @@ Write algorithms the way *Introduction to Algorithms* (CLRS) prints them, withou
 
 To change a block later, hover over it in reading view or Live Preview and click **Edit**. In the source editor, put the cursor inside the block and run **Edit pseudocode block under cursor**, or use the right-click menu.
 
+To turn existing code into pseudocode, select it (or put the cursor in a code block) and run **Convert selection or code block to pseudocode**; the builder opens with it parsed, and **Save** replaces it with a ` ```pseudo ` block. The copy icon next to **Edit** (or **Copy pseudocode block as LaTeX**) puts standard LaTeX on the clipboard, with the `\usepackage` lines it needs in a comment on top.
+
 The builder has a **Typing tips and shortcuts** panel under the preview, and the line at the bottom of the builder always says what the keyboard does in the field you are in.
 
 ## Building by typing
@@ -36,12 +39,17 @@ You never have to reach for the toolbar. Type at the start of a line:
 | `for each v in G.V` (also `for v ∈ S`) | A for-each loop. |
 | `while i > 0` | A while loop. |
 | `repeat` … `until done` | A repeat loop; the `until` line closes it. |
+| `loop` | An endless loop (leave it with `break` or `return`). |
+| `switch x`, then `case 1:` / `default:` (also `match`, `case _:`) | A switch; typing `case` on a line inside a case starts the next case. |
+| `parallel for i = 1 to n`; `spawn`, `sync` | CLRS multithreaded pseudocode (`spawn` and `sync` are bold). |
+| `for (int i = 0; i < n; i++)`, `for i in range(1, n + 1)` | A counting loop with CLRS bounds (`i = 0 to n - 1`, `i = 1 to n`). |
 | `return x`, `print x`, `break`, `continue` | The matching statement. |
 | `procedure Max-Heapify(A, i)` (also `function`, `def`, `algorithm`) | A procedure; typing `(` moves you to the parameters. |
 | `Input: …`, `Output: …` (also `Require:`, `Ensure:`) | Require / Ensure lines. |
 | `// note` | A comment line, numbered like in CLRS. |
 | `x = 0 // note` | A trailing comment: typing ` // ` moves the rest into the comment field. |
 | `end`, `end if`, `}` | Leaves the current block. |
+| `如果 x > 0 则`, `否则`, `否则如果`, `当 i > 0 时`, `对于 i = 1 到 n`, `对每个 v ∈ V`, `重复` … `直到`, `返回`, `过程`, `输入：`, `输出：` | Chinese keywords work the same way. |
 
 Conversions only happen when you type the keyword, so editing old text that happens to start with `for` changes nothing. They wait while an input method is composing. <kbd>Ctrl/Cmd</kbd>+<kbd>Z</kbd> undoes just the conversion and keeps your text.
 
@@ -61,13 +69,16 @@ Conversions only happen when you type the keyword, so editing old text that happ
 | <kbd>Ctrl/Cmd</kbd>+<kbd>Enter</kbd> | Save and close. |
 | <kbd>Esc</kbd> | Close (asks first if there are unsaved changes). |
 
+On phones and tablets the toolbar has **⇤** / **⇥** buttons in place of <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd>.
+
 With the mouse: the toolbar adds any statement type, each row has **+**, **⋯** (more actions) and **✕** buttons, rows can be dragged by their **⠿** handle, and block rows can be collapsed.
 
 ### Pasting
 
 Paste several lines into any line, or into the title, and they become rows:
 
-- **Indented pseudocode**: Python style (`def`, `elif`, trailing `:`), C style (`{ }`, `;`, `} else {`) or `end if` / `end while` style.
+- **Code and indented pseudocode**: Python (`def`, `elif`, `range()`, `//`, docstrings, `match`), C / Java / JavaScript (`{ }` in any brace style, `;`, an `if` without braces owning one statement, `for (;;)`, `do … while`, `switch`), Pascal (`begin` / `end`) or `end if` / `end while` style. Types in declarations and parameters (`int x = 0`, `def f(a: int) -> int`) are dropped; one-line `if x: return y` is split. Markdown code fences around the text are ignored.
+- **Chinese pseudocode** (`如果` / `否则` / `当` / `对于` / `返回` …).
 - **CLRS text** with line numbers: the numbers are dropped, `INSERTION-SORT(A)` becomes the procedure header (named Insertion-Sort; acronyms such as BFS stay upper case), and `←`, `≠`, `≤`, `≥` are converted.
 - **LaTeX** (`\State`, `\If{…}`, …) is read like a saved block.
 
@@ -88,6 +99,11 @@ Builder fields are typeset as math automatically; no `$…$` needed.
 | `key`, `heap-size` | Multi-letter names in italic |
 | `max(a, b)`, `lg n`, `x mod y` | Upright operators |
 | `A[1..n]` | The CLRS range dots |
+| `floor(n/2)`, `ceil(x)`, `sqrt(n)`, `abs(x)` | ⌊n/2⌋, ⌈x⌉, √n, \|x\| |
+| `inf`, `infinity`, `∞` | ∞ |
+| `None`, `null`, `nil` | NIL |
+| `n**2`, `!done` | n², not *done* |
+| `i % 2`, `S ∪ {u}`, `heap_size`, `a & b`, `cost $5` | Exactly these characters (`heap_size` is one italic name) |
 | `error "heap underflow"` | **error** “heap underflow” |
 | `exchange A[i] with A[j]` | A phrase: words upright, spaces kept |
 
@@ -124,11 +140,26 @@ Supported commands:
 - Structure: `\begin{algorithm}`, `\caption`, `\begin{algorithmic}`
 - Procedures: `\Procedure` / `\EndProcedure`, `\Function` / `\EndFunction`
 - Branches: `\If`, `\ElsIf` (or `\Elif`), `\Else`, `\EndIf`
-- Loops: `\For` (with `to`, `downto`, `\To` or `\DownTo`), `\ForAll`, `\EndFor`, `\While` / `\EndWhile`, `\Repeat` / `\Until`
-- Statements: `\State`, `\Return`, `\Print`, `\Break`, `\Continue`, `\Require`, `\Ensure`, `\Input`, `\Output`
-- Inline: `\Call{Name}{$args$}`, `\Comment{…}`, `\textsc{nil}`, `\twodots`, `\gets`, `\le`, `\ge`, `\ne`, `\mathit`, `\texttt`, …
+- Loops: `\For` (with `to`, `downto`, `\To` or `\DownTo`), `\ForAll` / `\ForEach`, `\EndFor`, `\ParFor`, `\While` / `\EndWhile`, `\Repeat` / `\Until`, `\Loop` / `\EndLoop`
+- Switch: `\Switch` / `\EndSwitch`, `\Case{…}` / `\Default` (`\EndCase` optional)
+- Statements: `\State`, `\Statex` (an unnumbered line), `\Return`, `\Print`, `\Break`, `\Continue`, `\Require`, `\Ensure`, `\Input`, `\Output`
+- Inline: `\Call{Name}{$args$}`, `\Comment{…}`, `\textsc{nil}`, `\twodots`, `\gets`, `\le`, `\ge`, `\ne`, `\mathit`, `\texttt`, `\ref{…}`, …
+- Line options: `\label{name}` after a line, `% highlight` at the end of a line, `\setcounter{ALG@line}{k}`, `\begin{algorithmic}[1]` / `[0]` (see below)
+
+An `\End…` that does not match the open block (a stray `\EndWhile` inside an if) is ignored instead of closing the wrong block.
 
 Rules of thumb: math goes inside `$…$` (text outside it stays text); write calls as `\Call{…}{…}` outside math (`\State $x \gets$ \Call{Extract-Min}{$Q$}`); write `and` / `or` between math runs (`\If{$a < 0$ and $b > 0$}`). Commands the plugin does not know are kept as raw lines.
+
+### Block options
+
+Set these in the builder (the **Line numbers** and **Start at** fields, and **Highlight line** / **Label for \ref…** in a row's **⋯** menu) or by hand:
+
+| Write | Effect |
+|---|---|
+| `\begin{algorithmic}[1]` / `[0]` | Line numbers always shown / hidden for this block, whatever the setting says. |
+| `\setcounter{ALG@line}{4}` | Numbering continues from 5 (first line) or jumps (between lines). |
+| `\State … \label{init}` and `line \ref{init}` | `\ref` shows the number of the labelled line, also across procedures. |
+| `\State … % highlight` | The line gets a highlighted background. |
 
 ## How it looks
 
@@ -151,13 +182,15 @@ Rendered blocks redraw as soon as a setting changes.
 
 ## Compatibility
 
-- Desktop and mobile.
+- Desktop and mobile. Blocks on Canvas cards render and can be edited with **Edit**.
 - Only one plugin can render ` ```pseudo ` blocks. If another plugin (such as **Pseudocode**) already does, Pseudocode Suite shows a notice; turn the other plugin off and reload. Blocks written for that plugin keep working, and its settings are migrated automatically.
 
 ## Known limitations
 
-- LaTeX commands outside the supported subset are shown as raw lines.
+- LaTeX commands outside the supported subset are shown as raw lines. `algorithm2e` syntax (`\KwIn`, `\eIf`, `\;`) is not supported.
 - Pasted text without indentation or end markers cannot be nested automatically.
+- Paste conversion is a best effort: C `for` loops with other steps than `++` / `--` keep their header as written, Python's `while … else` becomes a comment, and `goto` / labels stay plain statements.
+- TeX typed into a field (`\cup`) is kept as written; it is not turned back into `∪`.
 
 ## Development
 

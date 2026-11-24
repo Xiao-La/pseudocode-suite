@@ -67,3 +67,9 @@ Obsidian 安装插件时只下载 `main.js`、`manifest.json`、`styles.css`，�
 - 打字转换只在“刚打出”时触发（与上一次的值 `settled` 比较），输入法组字期间跳过，`compositionend` 时再判断；每次转换是一个撤销步骤。
 - 手写块里的独立 `\Comment{…}` 行并到上一条语句的行尾（LaTeX 的语义）；搭建器里输入或粘贴的 `// …` 行保存为 `\State \Comment{…}`，单独占一行。
 - 设置里的 `builderTips` 记录提示面板是否展开；它不影响渲染，所以用 `saveSettingsOnly` 保存，不重绘已渲染的块。
+- 存储用的方言和导出不同：保存时写插件自己认的命令（`\Elif`、`\Print`、`\To`、`\ParFor`、`\Switch`/`\Case`/`\Default`、`% highlight`、`\setcounter{ALG@line}{k}`），`PS.exportLatex` 另外生成标准 algpseudocode（`\ElsIf`、`\State \Return`、`\textbf{to}`、`\makeatletter…`，需要的 `\algdef` 写在开头注释里）。
+- 行的附加信息（`\label`、高亮）记在节点上，键名由 `PS.metaKey(prefix, name)` 决定：if 的 else 行是 `elseLabel` / `elseMark`，repeat 的 until 行是 `untilLabel` / `untilMark`，elif 分支记在各自的 branch 上。`\ref{}` 在 `PS.buildRows` 里解析成行号。
+- 不带 `\` 的输入框内容序列化时经 `escapePlain` 转义 `% & # $ { }`（`^` / `_` 后的组除外），`snake_case` 写成 `\mathit{a\_b}`；`fromMath` 读回时再还原，所以输入框里看到的就是打的字。
+- `\End…` 只关闭同类的最近一层（`closeTo`），对不上的忽略；`\Case` / `\Default` 遇到下一个 case 自动收尾。
+- 粘贴解析（`parsePlain`）先判断风格：`python`（行尾 `:`）、`braces`（`{ }`）或显式 end；不带大括号的 `if` / `for` 只拥有下一条语句（`settle()`）。
+- Canvas 文件是 JSON：编辑时按内容找到卡片；画布开着就通过 `view.canvas.nodes` 的 `setText` 修改（内部接口，可能变），否则用 `vault.process` 只替换那张卡片的 `text` 字符串。

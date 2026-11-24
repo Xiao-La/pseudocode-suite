@@ -5,11 +5,24 @@
   const ALT = IS_MAC ? '⌥' : 'Alt+';
   const SHIFT = IS_MAC ? '⇧' : 'Shift+';
   const HISTORY_LIMIT = 100;
+  // Phones and tablets: no Tab key, so indenting goes through buttons and the ⋯ menu.
+  const TOUCH = typeof Platform !== 'undefined' && !!Platform.isMobile;
+  const INDENT_HINT = TOUCH ? '⇥ / ⇤ buttons: indent / outdent' : `Tab / ${SHIFT}Tab: indent / outdent`;
   // The focused window's document (the builder may open in a popout window).
   const activeDoc = () => (typeof activeDocument !== 'undefined' ? activeDocument : document);
 
   const hasCjk = (value) => /[一-鿿]/.test(String(value));
   const hasTex = (value) => /[\\$]/.test(String(value || ''));
+
+  /** Put text on the clipboard and say so. */
+  PS.copyText = async function copyText(text, message) {
+    try {
+      await navigator.clipboard.writeText(text);
+      new Notice(message || 'Copied');
+    } catch (error) {
+      new Notice(`Could not copy: ${error && error.message ? error.message : error}`);
+    }
+  };
 
   function cloneNode(node) {
     const copy = JSON.parse(JSON.stringify(node));
@@ -22,8 +35,16 @@
       case 'if': return PS.node('if', { branches: [{ cond: '', body: [] }], elseBody: null });
       case 'while': return PS.node('while', { cond: '', body: [] });
       case 'for': return PS.node('for', { init: '', bound: '', downto: false, body: [] });
+      case 'parfor': return PS.node('for', { parallel: true, init: '', bound: '', downto: false, body: [] });
       case 'forall': return PS.node('for', { all: true, init: '', bound: '', downto: false, body: [] });
       case 'repeat': return PS.node('repeat', { body: [], until: '' });
+      // No field of their own: they start with a first line to type in.
+      case 'loop': return PS.node('loop', { body: [newNode('state')] });
+      case 'default': return PS.node('case', { default: true, value: '', body: [newNode('state')] });
+      case 'switch': return PS.node('switch', { cond: '', body: [] });
+      case 'case': return PS.node('case', { value: '', body: [] });
+      case 'statex': return PS.node('statex', { text: '', textMath: false });
+      case 'counter': return PS.node('counter', { value: '' });
       case 'function': return PS.node('function', { kind: 'Procedure', name: '', args: '', body: [] });
       case 'call': return PS.node('call', { name: '', args: '' });
       case 'break':
@@ -44,6 +65,12 @@
     continue: { chip: 'continue', parts: [] },
     call: { chip: 'call', parts: [field('name', 'procedure name', false), '(', field('args', 'args, e.g. A, i'), ')'] },
     raw: { chip: 'raw', parts: [field('text', 'unrecognized raw line', false)] },
+    statex: { chip: 'text', parts: [field('text', 'unnumbered line, e.g. \\textbf{Phase 1}; empty for a blank line', false)] },
+    counter: { chip: 'line no.', parts: ['next line is number', field('value', 'e.g. 5', false)], noComment: true },
+    loop: { chip: 'loop', parts: [] },
+    switch: { chip: 'switch', parts: [field('cond', 'value, e.g. op')] },
+    case: { chip: 'case', parts: [field('value', 'value, e.g. 1')] },
+    default: { chip: 'default', parts: [] },
     comment: { chip: '//', parts: [field('text', 'comment text', false)], noComment: true },
     while: { chip: 'while', parts: [field('cond', 'condition, e.g. i > 0 and A[i] > key')] },
     forall: { chip: 'for each', parts: [field('init', 'element in set, e.g. v in G.V')] },
@@ -51,6 +78,14 @@
       chip: 'for',
       parts: [
         field('init', 'start, e.g. j = 2'),
+        { select: 'downto', options: [['to', false], ['downto', true]] },
+        field('bound', 'end, e.g. n'),
+      ],
+    },
+    parfor: {
+      chip: 'parallel for',
+      parts: [
+        field('init', 'start, e.g. i = 1'),
         { select: 'downto', options: [['to', false], ['downto', true]] },
         field('bound', 'end, e.g. n'),
       ],
@@ -70,8 +105,10 @@
     ['Return', 'return'], ['Call', 'call'], ['Procedure', 'function'],
   ];
   const MORE_INSERTS = [
-    ['For each', 'forall'], ['Repeat … until', 'repeat'], ['Require', 'require'], ['Ensure', 'ensure'],
-    ['Break', 'break'], ['Continue', 'continue'], ['Print', 'print'], ['Comment line', 'comment'],
+    ['For each', 'forall'], ['Repeat … until', 'repeat'], ['Loop', 'loop'], ['Parallel for', 'parfor'],
+    ['Switch', 'switch'], ['Case', 'case'], ['Default case', 'default'],
+    ['Require', 'require'], ['Ensure', 'ensure'], ['Break', 'break'], ['Continue', 'continue'], ['Print', 'print'],
+    ['Comment line', 'comment'], ['Unnumbered line', 'statex'], ['Set line number', 'counter'],
   ];
 
   /* ---- help ---- */
@@ -82,16 +119,19 @@
     ['else · else if y < 0', 'A branch of the if above'],
     ['for i = 1 to n', 'A for loop: typing “ to ” or “ downto ” jumps to the end value'],
     ['for each v in G.V', 'A for-each loop'],
-    ['while i > 0 · repeat · until done', 'Loops; until closes the repeat above'],
+    ['while i > 0 · repeat · until done · loop', 'Loops; until closes the repeat above'],
+    ['parallel for i = 1 to n', 'A parallel loop (CLRS multithreading); spawn and sync are bold'],
+    ['switch x · case 1: · default:', 'A switch and its cases'],
     ['return x · break · continue', 'Statements'],
     ['procedure Max-Heapify(A, i)', 'A procedure: typing ( jumps to the parameters'],
     ['// note', 'A comment line; x = 0 // note adds a comment to a line'],
     ['end · }', 'Leaves the block (so does Enter on an empty last line)'],
+    ['如果 · 否则 · 对于 i = 1 到 n · 当 · 返回', 'Chinese keywords work too (重复 / 直到, 跳出, 继续, 过程 …)'],
   ];
   const HELP_KEYS = [
     ['Enter', 'New line (inside a block head: its first line)'],
     ['Backspace', 'On an empty line: delete it. At the start of a block head: back to a plain line'],
-    [`Tab · ${SHIFT}Tab`, 'Indent · outdent'],
+    [TOUCH ? '⇥ · ⇤' : `Tab · ${SHIFT}Tab`, 'Indent · outdent'],
     [`${ALT}↑ · ${ALT}↓`, 'Move the line'],
     ['↑ · ↓', 'Previous · next field'],
     [`${MOD}/`, 'Show or hide the comment field'],
@@ -104,7 +144,10 @@
     ['<= · >= · != · ==', '≤ · ≥ · ≠ · comparison (a single = is assignment)'],
     ['NIL · TRUE · FALSE', 'Constants, in small caps'],
     ['Insertion-Sort(A)', 'Calls: capitalized names with ( are set in small caps'],
-    ['key · heap-size', 'Variable names in italic, as in CLRS'],
+    ['key · heap-size · heap_size', 'Variable names in italic, as in CLRS'],
+    ['floor(n/2) · ceil(x) · sqrt(n) · abs(x)', '⌊n/2⌋ · ⌈x⌉ · √n · |x|'],
+    ['inf · None · n**2 · !done', '∞ · NIL · n² · not done'],
+    ['i % 2 · S ∪ {u} · cost $5', 'Written as typed: no need to escape TeX characters'],
   ];
 
   function renderHelp(parent) {
@@ -126,7 +169,11 @@
     section('Writing expressions', HELP_MATH);
     parent.createDiv({
       cls: 'pb-help-note',
-      text: 'Paste several lines (Python or C style, CLRS with line numbers, or algorithmicx LaTeX) into any line or the title to import them as rows.',
+      text: 'Paste several lines (Python, C, Java or Pascal, CLRS with line numbers, Chinese pseudocode, or algorithmicx LaTeX) into any line or the title to import them as rows.',
+    });
+    parent.createDiv({
+      cls: 'pb-help-note',
+      text: 'The ⋯ menu of a line can highlight it or give it a label; write \\ref{label} in any line or comment to show that line’s number.',
     });
   }
 
@@ -138,7 +185,7 @@
     if (kind === 'until') return 'Enter: new line after the loop';
     switch (node && node.type) {
       case 'state':
-        if (!empty) return `Enter: new line · type “ // ” to add a comment · Tab / ${SHIFT}Tab: indent / outdent · ${ALT}↑↓: move`;
+        if (!empty) return TOUCH ? `Enter: new line · type “ // ” to add a comment · ${INDENT_HINT}` : `Enter: new line · type “ // ” to add a comment · ${INDENT_HINT} · ${ALT}↑↓: move`;
         return nested
           ? 'Type if / for / while / else / return / // … to make a block · Enter on this empty line leaves the block · Backspace deletes it'
           : 'Type if / for / while / repeat / return / procedure / // … to make a block · or paste several lines';
@@ -153,8 +200,16 @@
         return key === 'name' ? 'Type ( to jump to the parameters' : 'Enter: first line of the procedure';
       case 'call':
         return key === 'name' ? 'Type ( to jump to the arguments' : 'Enter: new line';
+      case 'switch':
+        return 'Enter: first line inside · type case 1: or default: to add cases';
+      case 'case':
+        return 'Enter: first line of this case · type case or default on a line below for the next one';
+      case 'counter':
+        return 'The number the next line gets (as \\setcounter{ALG@line} in LaTeX)';
+      case 'statex':
+        return 'An unnumbered line: a heading, or empty for a blank line';
       default:
-        return `Enter: new line · Tab / ${SHIFT}Tab: indent / outdent · ${MOD}Z: undo · ${MOD}Enter: save`;
+        return TOUCH ? `Enter: new line · ${INDENT_HINT}` : `Enter: new line · ${INDENT_HINT} · ${MOD}Z: undo · ${MOD}Enter: save`;
     }
   }
 
@@ -194,8 +249,41 @@
     if (Array.isArray(value)) { value.forEach(markSourceProse); return; }
     if (!value || typeof value !== 'object') return;
     for (const [key, child] of Object.entries(value)) {
-      if (key.endsWith('Math') && child === false) value[`${key.slice(0, -4)}Prose`] = true;
+      // An empty field (`\State \text{}`, a saved blank line) is not prose yet.
+      if (key.endsWith('Math') && child === false && String(value[key.slice(0, -4)] || '').trim()) value[`${key.slice(0, -4)}Prose`] = true;
       else if (child && typeof child === 'object') markSourceProse(child);
+    }
+  }
+
+  /** One-line text input (a line's label). */
+  class PromptModal extends Modal {
+    constructor(app, { title, value, placeholder, onSubmit }) {
+      super(app);
+      Object.assign(this, { heading: title, value: value || '', placeholder: placeholder || '', onSubmit });
+    }
+
+    onOpen() {
+      this.titleEl.setText(this.heading);
+      const input = this.contentEl.createEl('input', { cls: 'pb-prompt-input', attr: { type: 'text', placeholder: this.placeholder, spellcheck: 'false' } });
+      input.value = this.value;
+      const buttons = this.contentEl.createDiv('modal-button-container');
+      const submit = () => {
+        this.onSubmit(input.value.trim());
+        this.close();
+      };
+      buttons.createEl('button', { text: 'Cancel' }).addEventListener('click', () => this.close());
+      buttons.createEl('button', { cls: 'mod-cta', text: 'OK' }).addEventListener('click', submit);
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && !event.isComposing) {
+          event.preventDefault();
+          submit();
+        }
+      });
+      window.setTimeout(() => input.focus(), 0);
+    }
+
+    onClose() {
+      this.contentEl.empty();
     }
   }
 
@@ -224,6 +312,8 @@
       this.previewToken = 0;
       this.previewComponent = null;
       this.forceClose = false;
+      // Converting text: saving always writes the block, even with nothing edited.
+      this.alwaysDirty = !!options.dirty;
     }
 
     onOpen() {
@@ -252,7 +342,7 @@
     }
 
     isDirty() {
-      return PS.serializeLatex(this.model) !== this.initialLatex;
+      return this.alwaysDirty || PS.serializeLatex(this.model) !== this.initialLatex;
     }
 
     /** Esc, the close button and clicking outside all land here. */
@@ -310,6 +400,8 @@
         if (this.pasteLines(null, text)) event.preventDefault();
       });
 
+      this.renderOptions(left.createDiv('pb-options'));
+
       const toolbar = left.createDiv('pb-toolbar');
       PRIMARY_INSERTS.forEach(([label, type]) => {
         const button = toolbar.createEl('button', { text: `+ ${label}` });
@@ -321,6 +413,18 @@
         MORE_INSERTS.forEach(([label, type]) => menu.addItem((item) => item.setTitle(label).onClick(() => this.insertNode(newNode(type)))));
         this.showMenu(menu, event, more);
       });
+      if (TOUCH) {
+        // No Tab key on a touch keyboard.
+        const current = () => (this.selected ? this.index.get(this.selected.id) : null);
+        [['⇤', 'Outdent', (node) => this.outdent(node)], ['⇥', 'Indent', (node) => this.indent(node)]].forEach(([text, label, run]) => {
+          const button = toolbar.createEl('button', { text, attr: { 'aria-label': `${label} the selected line` } });
+          button.addEventListener('mousedown', (event) => event.preventDefault()); // keep the keyboard up
+          button.addEventListener('click', () => {
+            const info = current();
+            if (info) run(info.node);
+          });
+        });
+      }
 
       this.listEl = left.createDiv('pb-list');
       this.listEl.addEventListener('focusin', (event) => {
@@ -332,6 +436,9 @@
       const details = right.createEl('details', { cls: 'pb-latex' });
       details.createEl('summary', { text: 'Generated LaTeX' });
       this.latexEl = details.createEl('pre');
+      const copy = details.createEl('button', { cls: 'pb-copy-latex', text: 'Copy for a LaTeX document' });
+      copy.setAttribute('aria-label', 'Copy as standard algorithm / algpseudocode LaTeX, with the preamble it needs');
+      copy.addEventListener('click', () => PS.copyText(PS.exportLatex(this.model), 'LaTeX copied (preamble lines are at the top)'));
 
       // Tips stay open until closed once (remembered in the settings).
       this.helpEl = right.createEl('details', { cls: 'pb-help' });
@@ -362,6 +469,34 @@
       contentEl.addEventListener('input', () => this.updateHint());
       footer.createEl('button', { text: 'Cancel' }).addEventListener('click', () => this.close());
       footer.createEl('button', { cls: 'mod-cta', text: 'Save' }).addEventListener('click', () => this.save());
+    }
+
+    /** Numbering for this block: the setting, always or never; and the first line number. */
+    renderOptions(parent) {
+      const numbering = parent.createEl('label');
+      numbering.appendText('Line numbers');
+      const select = numbering.createEl('select', { cls: 'dropdown pb-select' });
+      [['Default', ''], ['Shown', 'on'], ['Hidden', 'off']].forEach(([label, value]) => {
+        const option = select.createEl('option', { text: label, value });
+        const current = this.model.numbers === true ? 'on' : this.model.numbers === false ? 'off' : '';
+        if (current === value) option.selected = true;
+      });
+      select.addEventListener('change', () => this.mutate(() => {
+        if (select.value === 'on') this.model.numbers = true;
+        else if (select.value === 'off') this.model.numbers = false;
+        else delete this.model.numbers;
+      }));
+      const startLabel = parent.createEl('label');
+      startLabel.appendText('Start at');
+      const start = startLabel.createEl('input', { cls: 'pb-start', attr: { type: 'number', min: '1', placeholder: '1' } });
+      start.value = this.model.start ? String(this.model.start) : '';
+      start.addEventListener('input', () => {
+        this.beginTyping('start');
+        const value = parseInt(start.value, 10);
+        if (value > 1) this.model.start = value;
+        else delete this.model.start;
+        this.schedulePreview();
+      });
     }
 
     /** Say what the keyboard does in the focused field. */
@@ -528,10 +663,14 @@
       }
       // `if x > 0 then`, `while (i < n) {`: drop what other dialects put around a condition.
       const holder = key === 'cond' && node.type === 'if' ? node.branches[Number.isInteger(row.slot) ? row.slot : 0]
-        : (key === 'cond' || key === 'until' || key === 'init' || key === 'bound') ? node : null;
+        : (key === 'cond' || key === 'until' || key === 'init' || key === 'bound' || key === 'value') ? node : null;
       if (holder && typeof holder[key] === 'string') {
         const clean = PS.cleanCondition(holder[key]);
-        if (clean !== holder[key].trim()) holder[key] = clean;
+        if (clean !== holder[key].trim()) {
+          holder[key] = clean;
+          // `i > 0 时`: the Chinese word that made it plain text is gone.
+          if (!holder[`${key}Prose`] && clean) holder[`${key}Math`] = !hasCjk(clean);
+        }
       }
       if (PS.isContainer(node) && row.kind !== 'until' && !shift) this.addInside(node, row.slot);
       else this.addAfter(node);
@@ -562,7 +701,9 @@
         if (!previous) this.captionInput.focus();
         return true;
       }
-      const field = { if: 'cond', while: 'cond', for: 'init', return: 'text', print: 'text', require: 'text', ensure: 'text' }[node.type];
+      const field = {
+        if: 'cond', while: 'cond', for: 'init', return: 'text', print: 'text', require: 'text', ensure: 'text', switch: 'cond', case: 'value',
+      }[node.type];
       if (!field || key !== field) return false;
       if (node.type === 'if' && (node.branches.length > 1 || node.elseBody)) return false;
       const source = node.type === 'if' ? node.branches[0] : node;
@@ -628,6 +769,27 @@
       if (node.type === 'state' && part.key === 'text' && row.kind === 'node') {
         const typed = PS.typedLine(value);
         return typed && !PS.typedLine(previous) ? this.applyTyped(node, typed) : false;
+      }
+      if (node.type === 'for' && part.key === 'init') {
+        // `for (int i = 0; i < n; i++)` (C) or `for i in range(1, n)` (Python), once complete:
+        // a counting loop with CLRS bounds.
+        const counted = (text) => /\)\s*$/.test(text) && /;|\brange\s*\(/.test(text) && PS.splitForHead(text).fields.split;
+        if (counted(value) && !counted(previous)) {
+          const head = PS.splitForHead(value);
+          this.mutate(() => {
+            Object.assign(node, {
+              all: false,
+              init: PS.normalizeOperators(head.fields.init),
+              initMath: true,
+              bound: PS.normalizeOperators(head.fields.bound),
+              boundMath: true,
+              downto: !!head.fields.downto,
+            });
+            this.pendingFocus = `${node.id}::bound`;
+            this.pendingCaret = 'end';
+          });
+          return true;
+        }
       }
       if (node.type === 'for' && !node.all && part.key === 'init') {
         if (fresh(/^\s*(?:each|all)\s/i) || fresh(/^[^\s=]+\s+(?:in|∈)\s/i)) {
@@ -752,12 +914,22 @@
       if (!replacement) return false;
       this.mutate(() => {
         if (carry != null && replacement.type !== 'comment') replacement.comment = carry;
-        info.array.splice(info.index, 1, replacement);
+        if (replacement.type === 'case' && info.parent && info.parent.type === 'case') {
+          // `case 2:` typed inside the case above starts the next case of the same switch,
+          // taking the lines below it along.
+          const owner = this.index.get(info.parent.id);
+          replacement.body.push(...info.array.splice(info.index).slice(1));
+          owner.array.splice(owner.index + 1, 0, replacement);
+        } else {
+          info.array.splice(info.index, 1, replacement);
+        }
         const fieldless = replacement.type === 'break' || replacement.type === 'continue';
-        if (replacement.type === 'repeat') {
+        const headless = replacement.type === 'repeat' || replacement.type === 'loop' || (replacement.type === 'case' && replacement.default);
+        if (headless || (replacement.type === 'case' && fields.rest)) {
+          // No condition to type yet (or one already given): straight to the first line.
           const rest = String(fields.rest || '');
-          const first = rest.trim() ? PS.statementNode(rest) : newNode('state');
-          replacement.body.push(first);
+          const first = rest.trim() ? PS.lineNode(rest) : newNode('state');
+          replacement.body.unshift(first);
           this.focusNew(first, 'end');
         } else if (enter || fieldless) {
           // Enter on `return` / `break`: next line; on a block head: its first line.
@@ -912,7 +1084,7 @@
           return;
 
         default: {
-          const spec = ROWS[node.type === 'for' && node.all ? 'forall' : node.type] || ROWS.raw;
+          const spec = ROWS[specKey(node)] || ROWS.raw;
           this.renderRow({
             node, depth, chip: spec.chip, parts: spec.parts,
             comment: spec.noComment ? null : { target: node, key: 'comment' },
@@ -960,6 +1132,10 @@
       }
 
       element.createSpan({ cls: `pb-chip pb-chip-${kind === 'node' ? node.type : kind}`, text: chip });
+      const { holder, prefix } = metaAccess(row);
+      if (holder[PS.metaKey(prefix, 'mark')]) element.addClass('pb-marked');
+      const label = holder[PS.metaKey(prefix, 'label')];
+      if (label) element.setAttribute('title', `Label: ${label} (\\ref{${label}} shows this line's number)`);
       const fields = element.createDiv('pb-fields');
       parts.forEach((part) => this.renderPart(fields, row, target, part));
       if (comment) this.renderComment(fields, row);
@@ -1132,6 +1308,25 @@
       item('Outdent', 'outdent', () => this.outdent(node), `${SHIFT}Tab`);
       menu.addSeparator();
       if (this.commentAccess(row)) item('Trailing comment', 'message-square', () => this.toggleComment(row), `${MOD}/`);
+      if (node.type !== 'counter') {
+        const { holder, prefix } = metaAccess(row);
+        const markKey = PS.metaKey(prefix, 'mark');
+        const labelKey = PS.metaKey(prefix, 'label');
+        item(holder[markKey] ? 'Remove highlight' : 'Highlight line', 'highlighter', () => this.mutate(() => {
+          if (holder[markKey]) delete holder[markKey];
+          else holder[markKey] = true;
+        }));
+        item(holder[labelKey] ? `Label: ${holder[labelKey]}…` : 'Label for \\ref…', 'tag', () => new PromptModal(this.app, {
+          title: 'Line label',
+          value: holder[labelKey] || '',
+          placeholder: 'e.g. loop-test; write \\ref{loop-test} to show this line’s number',
+          onSubmit: (value) => this.mutate(() => {
+            const clean = value.replace(/[{}\\\s]+/g, '-');
+            if (clean) holder[labelKey] = clean;
+            else delete holder[labelKey];
+          }),
+        }).open());
+      }
       item('Duplicate', 'copy', () => this.duplicate(node), `${MOD}${SHIFT}D`);
       item(kind === 'branch' ? 'Remove this branch' : kind === 'else' ? 'Remove else' : 'Delete', 'trash-2', () => this.removeRow(row), `${MOD}${SHIFT}K`);
       return menu;
@@ -1218,8 +1413,14 @@
     /** Focus a node's first field after the next render (`caret`: a position or 'end'). */
     focusNew(node, caret) {
       this.selected = { id: node.id };
+      // Blocks without a field of their own (loop, default) start at their first line.
+      if ((node.type === 'loop' || (node.type === 'case' && node.default)) && node.body.length) {
+        this.focusNew(node.body[0], caret);
+        return;
+      }
       const first = {
         if: '0:cond', while: ':cond', for: ':init', repeat: 'until:until', function: ':name', call: ':name',
+        switch: ':cond', case: ':value', counter: ':value',
       }[node.type] || ':text';
       this.pendingFocus = `${node.id}:${first}`;
       this.pendingCaret = caret == null ? null : caret;
@@ -1409,7 +1610,22 @@
   }
 
   /** Keyword lines that only mean something once Enter ends them. */
-  const BARE_KEYWORD = /^\s*(?:\}\s*)?(?:else(?:\s*if)?|elseif|elif|elsif|repeat|return|break|continue|end(?:\s+\w+)?|endif|endwhile|endfor|fi|od|done|\})\s*[:{;]?\s*$/i;
+  const BARE_KEYWORD = /^\s*(?:\}\s*)?(?:else(?:\s*if)?|elseif|elif|elsif|repeat|loop|do|default|otherwise|return|break|continue|end(?:\s+\w+)?|endif|endwhile|endfor|endloop|fi|od|done|\}|否则|重复|循环|跳出(?:循环)?|中断|继续|返回|其他情况|结束(?:如果|循环|过程|函数|算法)?)\s*[:：{;]?\s*$/i;
+
+  /** The ROWS layout of a node. */
+  function specKey(node) {
+    if (node.type === 'for') return node.all ? 'forall' : node.parallel ? 'parfor' : 'for';
+    if (node.type === 'case') return node.default ? 'default' : 'case';
+    return node.type;
+  }
+
+  /** Where a row's label and highlight live (see PS.metaKey). */
+  function metaAccess({ node, slot, kind }) {
+    if (node.type === 'if' && kind === 'else') return { holder: node, prefix: 'else' };
+    if (node.type === 'if' && Number.isInteger(slot) && slot > 0) return { holder: node.branches[slot], prefix: '' };
+    if (kind === 'until') return { holder: node, prefix: 'until' };
+    return { holder: node, prefix: '' };
+  }
 
   function parseSlot(value) {
     if (value == null || value === '') return undefined;
@@ -1417,6 +1633,7 @@
   }
 
   PS.BuilderModal = BuilderModal;
+  PS.PromptModal = PromptModal;
   PS.builderHint = hintFor;
   PS.ConfirmModal = ConfirmModal;
 })(PS);

@@ -186,4 +186,26 @@ ok(!/mkern/.test(PS.parseInline('$q = a$', true)[0].value), 'equality in comment
 const andRow = rowsOf('\\While{$i > 0$ and $A[i] > \\mathit{key}$}\n\\EndWhile')[0].text;
 ok(PS.parseInline(andRow).some((t) => t.type === 'text' && t.value.trim() === 'and'), 'and is roman text', andRow);
 
+// 2.3: options, labels, highlight and the new blocks.
+{
+  const rows = rowsOf([
+    '\\begin{algorithmic}[1]', '\\setcounter{ALG@line}{4}', '\\Statex \\textbf{Phase}', '\\State $x = 1$ \\label{init} % highlight',
+    '\\Loop', '\\State go to line \\ref{init}', '\\EndLoop', '\\Switch{$c$}', '\\Case{$1$}', '\\State $a$', '\\EndCase', '\\Default',
+    '\\State $b$', '\\EndCase', '\\EndSwitch', '\\ParFor{$i = 1$ \\To $n$}', '\\State \\textbf{sync}', '\\EndFor', '\\State \\ref{nope}', '\\end{algorithmic}',
+  ].join('\n'));
+  ok(rows[0].kind === 'statex' && rows[0].number === null, 'Statex is an unnumbered line');
+  ok(rows[1].number === 5, 'setcounter: numbering starts at 5', rows[1]);
+  ok(rows[1].mark && !rows[2].mark, 'highlight on its line only');
+  ok(rows[3].text === 'go to line 5', '\\ref shows the labelled line number', rows[3].text);
+  ok(rows[rows.length - 1].text === '??', 'unknown \\ref shows ??');
+  ok(rows[2].text === '\\kw{loop}' && rows[3].depth === 1, 'loop row and body');
+  ok(rows[4].text === '\\kw{switch} $c$' && rows[5].text === '\\kw{case} $1$' && rows[7].text === '\\kw{default}', 'switch / case / default rows');
+  ok(rows[6].depth === 2, 'case body nested twice');
+  ok(rows[9].text.startsWith('\\kw{parallel for}'), 'parallel for', rows[9].text);
+  const started = PS.buildRows({ caption: '', start: 10, nodes: PS.parseLatex('\\State a\n\\State b').nodes });
+  ok(started[0].number === 10 && started[1].number === 11, 'model.start');
+  const refBefore = rowsOf('\\State see \\ref{later}\n\\State $y$ \\label{later}');
+  ok(refBefore[0].text === 'see 2', 'forward \\ref', refBefore[0].text);
+}
+
 done();
